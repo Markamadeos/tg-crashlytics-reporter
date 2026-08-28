@@ -1,0 +1,44 @@
+{
+  "groups": [
+    {
+      "issue": {
+        "id": "79904dab067716604c9a61a4c9af9c19",
+        "title": "SourceFile - q2.f.R",
+        "subtitle": "androidx.datastore.preferences.protobuf.z - Protocol message contained an invalid tag (zero).",
+        "errorType": "FATAL",
+        "state": "OPEN",
+        "firstSeenVersion": "5.7.0",
+        "lastSeenVersion": "5.7.0"
+      },
+      "metrics": [
+        {
+          "startTime": "2026-08-25T17:40:56Z",
+          "endTime": "2026-08-26T17:40:56Z",
+          "eventsCount": "73",
+          "impactedUsersCount": "14",
+          "sessionsCount": "73"
+        }
+      ]
+    },
+    {
+      "issue": {
+        "id": "f50cf82a377b3da28e889b5e04340895",
+        "title": "SourceFile - B1.g$a$a.a",
+        "subtitle": "java.lang.IllegalStateException - Apply is called on deactivated node J@d196d44 children: 0 measurePolicy: j0.w1@47922c0 deactivated: true",
+        "errorType": "FATAL",
+        "state": "OPEN",
+        "firstSeenVersion": "5.12.0",
+        "lastSeenVersion": "5.8.0"
+      },
+      "metrics": [
+        {
+          "startTime": "2026-08-25T17:40:56Z",
+          "endTime": "2026-08-26T17:40:56Z",
+          "eventsCount": "39",
+          "impactedUsersCount": "34",
+          "sessionsCount": "39"
+        }
+      ]
+    }
+  ]
+}

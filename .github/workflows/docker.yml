@@ -1,0 +1,80 @@
+name: build
+
+# Образ публикуется только с main и с тегов вида v1.2.3.
+# Пулл-реквесты собираются, но не пушатся — иначе любой PR смог бы
+# опубликовать что угодно под вашим именем на Docker Hub.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  # ЗАМЕНИТЬ на своё: docker-hub-логин/имя-образа
+  IMAGE: magw4y/tg-crashlytics-reporter
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      # Боевой тест сам пропускается без RUN_SMOKE — секреты в CI не нужны.
+      - name: Тесты
+        run: python -m pytest -q
+
+  publish:
+    needs: tests
+    runs-on: ubuntu-latest
+    # На пулл-реквестах только собираем, ничего не публикуя.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Логин в Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Теги и метки
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Две платформы намеренно: arm64 для разработки на Apple Silicon,
+      # amd64 для типичного NAS или сервера. Без этого образ, собранный
+      # на маке, на NAS не запустится.
+      - name: Сборка и публикация
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

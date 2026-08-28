@@ -1,0 +1,36 @@
+{
+  "groups": [
+    {
+      "version": {
+        "displayVersion": "5.15.0",
+        "buildVersion": "2026082001",
+        "displayName": "5.15.0 (2026082001)"
+      },
+      "metrics": [{"startTime": "2026-08-27T00:00:00Z", "endTime": "2026-08-28T00:00:00Z", "eventsCount": "41"}]
+    },
+    {
+      "version": {
+        "displayVersion": "5.15.0",
+        "buildVersion": "2026082501",
+        "displayName": "5.15.0 (2026082501)"
+      },
+      "metrics": [{"startTime": "2026-08-27T00:00:00Z", "endTime": "2026-08-28T00:00:00Z", "eventsCount": "2"}]
+    },
+    {
+      "version": {
+        "displayVersion": "5.14.0",
+        "buildVersion": "2026072901",
+        "displayName": "5.14.0 (2026072901)"
+      },
+      "metrics": [{"startTime": "2026-08-27T00:00:00Z", "endTime": "2026-08-28T00:00:00Z", "eventsCount": "469230"}]
+    },
+    {
+      "version": {
+        "displayVersion": "4.7.0",
+        "buildVersion": "10430",
+        "displayName": "4.7.0 (10430)"
+      },
+      "metrics": [{"startTime": "2026-08-27T00:00:00Z", "endTime": "2026-08-28T00:00:00Z", "eventsCount": "95043"}]
+    }
+  ]
+}

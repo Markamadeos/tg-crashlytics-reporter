@@ -1,0 +1,17 @@
+services:
+  crashdigest:
+    # Собирать локально — или закомментировать и взять готовый образ:
+    #   image: magw4y/tg-crashlytics-reporter:latest
+    build: .
+    image: crashdigest:local
+    container_name: crashdigest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    networks:
+      - vpn-proxy_default
+
+networks:
+  vpn-proxy_default:
+    external: true
