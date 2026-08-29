@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import requests
 
@@ -33,16 +35,18 @@ def ok():
     return FakeResponse(200, {"ok": True, "result": {"message_id": 1}})
 
 
-def test_sends_each_message_with_html_mode():
+def test_sends_each_message_with_rich_message():
     session = FakeSession(ok(), ok())
     Telegram("bt", "-100", session=session, sleep=lambda _: None).send(["a", "b"])
 
     assert len(session.calls) == 2
     call = session.calls[0]
-    assert call["url"] == "https://api.telegram.org/botbt/sendMessage"
+    assert call["url"] == "https://api.telegram.org/botbt/sendRichMessage"
     assert call["data"]["chat_id"] == "-100"
-    assert call["data"]["parse_mode"] == "HTML"
-    assert call["data"]["text"] == "a"
+    assert "rich_message" in call["data"]
+    rich = json.loads(call["data"]["rich_message"])
+    assert rich["markdown"] == "a"
+    assert rich["skip_entity_detection"] is True
     assert call["proxies"] is None
 
 
@@ -130,3 +134,45 @@ def test_429_with_non_json_body_falls_back_to_backoff():
     Telegram("bt", "-100", session=session, sleep=slept.append).send(["a"])
     assert slept == [BACKOFF_SECONDS]
     assert len(session.calls) == 2
+
+
+def test_send_uses_rich_message_endpoint_and_markdown():
+    """Дневные и недельные сообщения идут новым методом с отключённым автодетектом."""
+    session = FakeSession(FakeResponse(200, {"ok": True}))
+    Telegram("bt", "-100", session=session, sleep=lambda _: None).send(["# Заголовок"])
+
+    call = session.calls[0]
+    assert call["url"].endswith("/sendRichMessage")
+    payload = call["data"]
+    assert payload["chat_id"] == "-100"
+    rich = json.loads(payload["rich_message"])
+    assert rich["markdown"] == "# Заголовок"
+    assert rich["skip_entity_detection"] is True
+    assert "text" not in payload and "parse_mode" not in payload
+
+
+def test_send_plain_keeps_the_old_endpoint_and_html():
+    """Сообщение об отказе обязано дойти, когда сломалось всё остальное."""
+    session = FakeSession(FakeResponse(200, {"ok": True}))
+    Telegram("bt", "-100", session=session, sleep=lambda _: None).send_plain(["<b>x</b>"])
+
+    call = session.calls[0]
+    assert call["url"].endswith("/sendMessage")
+    payload = call["data"]
+    assert payload["text"] == "<b>x</b>"
+    assert payload["parse_mode"] == "HTML"
+    assert "rich_message" not in payload
+
+
+def test_rich_transport_retries_like_the_old_one():
+    """Ретраи не должны потеряться при смене метода."""
+    session = FakeSession(FakeResponse(500, {}), FakeResponse(200, {"ok": True}))
+    Telegram("bt", "-100", session=session, sleep=lambda _: None).send(["x"])
+    assert len(session.calls) == 2
+
+
+def test_rich_transport_scrubs_the_token():
+    session = FakeSession(FakeResponse(400, {}, text="url /botSECRET/sendRichMessage failed"))
+    with pytest.raises(TelegramError) as exc:
+        Telegram("SECRET", "-100", session=session, sleep=lambda _: None).send(["x"])
+    assert "SECRET" not in str(exc.value)

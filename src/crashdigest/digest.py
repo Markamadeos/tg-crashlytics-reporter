@@ -7,10 +7,25 @@ from datetime import datetime, timezone
 from typing import Sequence
 
 from crashdigest.crashlytics import IssueRow
+from crashdigest import markdown as md
 
-TELEGRAM_LIMIT = 4096
 CONSOLE = "https://console.firebase.google.com/v1/appid/project"
-MAX_LISTED = 30
+
+# Жёсткий лимит rich-сообщения 32768; берём с запасом на аномально длинные
+# имена классов вроде RemoteServiceException$CannotDeliverBroadcastException.
+BUDGET = 30000
+
+WEEKLY_TAIL = 20
+
+
+def _tg_len(text: str) -> int:
+    """Длина в кодовых единицах UTF-16 — так же, как исторически считает
+    длину сообщения Telegram (лимиты и offset'ы сущностей). Python `len()`
+    считает кодовые точки: не-BMP символы (эмодзи вроде 🔥) стоят 1 у нас и
+    2 у них, и бюджет, посчитанный в кодовых точках, может пропустить
+    сообщение, реально превышающее жёсткий лимит.
+    """
+    return len(text.encode("utf-16-le")) // 2
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -47,24 +62,35 @@ def _fmt_period(start: datetime, end: datetime) -> str:
     return f"{start.strftime('%d.%m %H:%M')} → {end.strftime('%d.%m %H:%M')}"
 
 
-def _pack(header: list[str], blocks: list[list[str]]) -> list[str]:
-    """Склеивает блоки в сообщения, не превышающие лимит Telegram."""
-    messages: list[str] = []
-    current = list(header)
-    has_content = False
+def _head(versions: Sequence[str] | None, period: str) -> str:
+    """Шапка двумя строками. <br>, а не \\n: внутри одного абзаца перевод
+    строки делается тегом, иначе Telegram склеит метки в одну строку.
+    """
+    lines = []
+    if versions:
+        lines.append(f"📦 Версии: **{md.esc(', '.join(versions))}**")
+    lines.append(f"🗓 Период: {period}")
+    return "<br>".join(lines)
 
-    for block in blocks:
-        candidate = current + block
-        if has_content and len("\n".join(candidate)) > TELEGRAM_LIMIT:
-            messages.append("\n".join(current))
-            current = list(block)
-        else:
-            current = candidate
-            has_content = True
 
-    if current:
-        messages.append("\n".join(current))
-    return messages
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _issue_cell(row: IssueRow, project: str, app_id: str, msg_limit: int) -> str:
+    """Имя класса — ссылка на issue, под ним текст ошибки.
+
+    Класс берётся ТОЛЬКО из subtitle: в title лежит обфусцированный фрейм
+    вида `SourceFile - B1.g$a$a.a`, и rsplit по нему даёт мусор.
+    """
+    cls, message = _split_subtitle(row.subtitle)
+    name = md.link(
+        md.esc(_short(cls.rsplit(".", 1)[-1] or cls, 30)),
+        issue_url(project, app_id, row.issue_id),
+    )
+    if message and msg_limit:
+        return f"{name}<br>{md.esc(_short(message, msg_limit))}"
+    return name
 
 
 def render(
@@ -75,86 +101,81 @@ def render(
     app_name: str,
     project: str,
     app_id: str,
-    truncated: bool = False,
     scanned: int | None = None,
     versions: Sequence[str] | None = None,
 ) -> list[str]:
-    period = _fmt_period(start, end)
-
-    # Шапка обязана называть срез: без неё «2 новых» нечем интерпретировать,
-    # а смена отслеживаемых версий видна только в конфиге.
-    versions_line = f"на версиях {html.escape(', '.join(versions))}" if versions else ""
+    head = _head(versions, _fmt_period(start, end))
+    name = md.esc(app_name)
 
     if not rows:
         # «Новых падений нет» неотличимо от «фильтр сломан и вернул 0 строк».
-        # Печатаем срез и сколько issue в нём известно: пустым сообщение
-        # бывает только когда новых ноль, значит все увиденные — известные.
-        parts = [f"✅ <b>{html.escape(app_name)}</b>: новых падений нет"]
-        scope = [p for p in (versions_line,) if p]
+        # Печатаем срез и сколько issue в нём известно.
+        lines = [f"# ✅ {name} — новых падений нет", "", head]
         if scanned is not None:
-            scope.append(
-                f"{scanned} {plural(scanned, 'известный', 'известных', 'известных')}"
-            )
-        if scope:
-            parts.append(" · ".join(scope))
-        parts.append(f"<i>{period}</i>")
-        return ["\n".join(parts)]
+            lines.append(f"<br>📊 Известных issue: **{scanned}**")
+        return ["\n".join(lines)]
 
-    header = [f"🔴 <b>Новые падения {html.escape(app_name)} — {len(rows)}</b>"]
-    if versions_line:
-        header.append(versions_line)
-    header.append(f"<i>{period}</i>")
-    if truncated:
-        header.append(
-            "⚠️ <i>разрыв наблюдения: окно обрезано до 90 дней, "
-            "часть периода не покрыта</i>"
-        )
-    header.append("")
+    top = [f"# 🔴 Новые падения {name} — {len(rows)}", "", head, ""]
+    used = _tg_len("\n".join(top))
 
-    # Без границы одна раздутая подпись без разделителя (класс = вся
-    # строка) или тысячи issue в одном окне дают сообщение длиннее лимита
-    # Telegram → неретраибельный HTTP 400 → состояние не продвигается →
-    # тот же issue снова и снова во всё расширяющемся окне, дайджест
-    # застревает навсегда. Перечисляем не больше MAX_LISTED, они уже
-    # отсортированы по числу событий, самые частые — первые.
-    listed = rows[:MAX_LISTED]
-    omitted = len(rows) - len(listed)
+    # Колонки типа события нет: при ERROR_TYPES=FATAL она повторяла одно и
+    # то же в каждой строке. ВНИМАНИЕ: если будет включён ANR, колонку надо
+    # вернуть — иначе падения и зависания смешаются неразличимо.
+    header = ("Ошибка", "События", "Юзеров")
 
-    blocks: list[list[str]] = []
-    for index, row in enumerate(listed, 1):
-        cls, message = _split_subtitle(row.subtitle)
-        block = [f"{index}. <b>{html.escape(cls[:200])}</b>"]
-        if message:
-            block.append(f"   {html.escape(message[:200])}")
-        block.append(
-            f"   {row.error_type} · "
-            f"{row.events_count} {plural(row.events_count, 'событие', 'события', 'событий')} · "
-            f"{row.impacted_users} {plural(row.impacted_users, 'юзер', 'юзера', 'юзеров')}"
-        )
-        url = issue_url(project, app_id, row.issue_id)
-        block.append(f'   <a href="{url}">открыть в Crashlytics</a>')
-        block.append("")
-        blocks.append(block)
+    # Account for table header and separator lines
+    used += _tg_len("| Ошибка | События | Юзеров |") + 1 + _tg_len("|:--|--:|--:|")
 
+    cells: list[list[str]] = []
+    omitted = 0
+    # Reserve space for "… и ещё N issue — см. консоль Crashlytics" message if needed
+    truncation_buffer = 100
+
+    for index, row in enumerate(rows):
+        cell = [
+            _issue_cell(row, project, app_id, 48),
+            f"**{row.events_count}**",
+            str(row.impacted_users),
+        ]
+        size = sum(_tg_len(c) for c in cell) + 10 + 1  # разделители, перевод строки и newline после строки
+        if used + size + truncation_buffer > BUDGET:
+            omitted = len(rows) - index
+            break
+        cells.append(cell)
+        used += size
+
+    parts = top + [md.table(header, cells, "lrr")]
     if omitted:
-        blocks.append([
-            f"… и ещё {omitted} {plural(omitted, 'issue', 'issue', 'issue')} "
-            "— см. консоль Crashlytics"
-        ])
+        parts += [
+            "",
+            f"… и ещё **{omitted}** {plural(omitted, 'issue', 'issue', 'issue')} "
+            "— см. консоль Crashlytics",
+        ]
+    return ["\n".join(parts)]
 
-    return _pack(header, blocks)
 
-
-def render_bootstrap(count: int, app_name: str) -> list[str]:
-    return [
-        f"🧭 <b>{html.escape(app_name)}</b>: инициализация\n"
-        f"Запомнено {count} {plural(count, 'issue', 'issue', 'issue')}, "
-        f"дальше сообщаю только о новых."
+def render_bootstrap(count: int, app_name: str,
+                     versions: Sequence[str] | None = None) -> list[str]:
+    lines = [
+        f"# 🧭 {md.esc(app_name)} — инициализация",
+        "",
+        f"Запомнено **{count}** {plural(count, 'issue', 'issue', 'issue')}, "
+        "дальше сообщаю только о новых.",
     ]
+    if versions:
+        lines += ["", f"📦 Версии: **{md.esc(', '.join(versions))}**"]
+    return ["\n".join(lines)]
 
 
 def render_error(headline: str, detail: str) -> list[str]:
-    return [f"⚠️ <b>{html.escape(headline)}</b>\n<code>{html.escape(detail[:600])}</code>"]
+    """Единственная форма на HTML: уходит через sendMessage, потому что
+    обязана дойти, когда сломалось всё остальное, включая сам rich.
+    """
+    return [
+        f"⚠️ <b>{html.escape(headline)}</b>\n"
+        f"<code>{html.escape(detail[:600])}</code>\n"
+        "Состояние не сдвинуто — падения не потеряются, придут следующим прогоном."
+    ]
 
 
 @dataclass(frozen=True)
@@ -212,8 +233,9 @@ def _fmt_week(period: tuple[datetime, datetime]) -> str:
     return f"{start.strftime('%d.%m')}–{end.strftime('%d.%m')}"
 
 
-def _fmt_change(was: int, now: int) -> str:
-    return f"{was} → {now} · {now - was:+d}"
+def _delta(was: int, now: int) -> str:
+    diff = now - was
+    return f"+{diff}" if diff > 0 else str(diff)
 
 
 def render_weekly(
@@ -230,40 +252,65 @@ def render_weekly(
     top: int,
 ) -> list[str]:
     arrow = "📈" if cur_totals.events > prev_totals.events else "📉"
-    header = [
-        f"{arrow} <b>Фон за неделю — {html.escape(app_name)}</b>",
-        f"на версиях {html.escape(', '.join(versions))}",
-        f"<i>{_fmt_week(previous)} → {_fmt_week(current)}</i>",
-        f"события {_fmt_change(prev_totals.events, cur_totals.events)}",
-        f"юзеров {_fmt_change(prev_totals.users, cur_totals.users)}",
+    period = f"{_fmt_week(previous)} → {_fmt_week(current)}"
+    parts = [
+        f"# {arrow} Фон за неделю — {md.esc(app_name)}",
         "",
+        _head(versions, period),
+        "",
+        md.table(
+            ("", "было", "стало", "Δ"),
+            [
+                ["события", str(prev_totals.events), f"**{cur_totals.events}**",
+                 _delta(prev_totals.events, cur_totals.events)],
+                ["юзеров", str(prev_totals.users), f"**{cur_totals.users}**",
+                 _delta(prev_totals.users, cur_totals.users)],
+            ],
+            "lrrr",
+        ),
     ]
 
     if not growth:
-        return ["\n".join(header + ["Растущих нет — фон не увеличивается."])]
+        return ["\n".join(parts + ["", "Растущих нет — фон не увеличивается."])]
 
     listed = list(growth[:top])
-    header.append(f"Растут сильнее всего — {len(listed)} из {len(growth)}:")
-    header.append("")
+    parts += ["", f"### 🔥 Растут сильнее всего — {len(listed)} из {len(growth)}", ""]
+    parts.append(md.table(
+        ("Ошибка", "Известен с", "Было", "Стало", "Δ", "Юзеров"),
+        [
+            [
+                _issue_cell(item.row, project, app_id, 44),
+                # «известен с», а не «стреляет с»: firstSeenVersion глобален
+                # и означает «известен с незапамятных времён».
+                md.esc(item.row.first_seen_version or "—"),
+                str(item.was_events),
+                f"**{item.row.events_count}**",
+                f"**+{item.delta}**",
+                str(item.row.impacted_users),
+            ]
+            for item in listed
+        ],
+        "llrrrr",
+    ))
 
-    blocks: list[list[str]] = []
-    for index, item in enumerate(listed, 1):
-        row = item.row
-        cls, message = _split_subtitle(row.subtitle)
-        block = [f"{index}. <b>{html.escape(cls[:200])}</b>"]
-        if message:
-            block.append(f"   {html.escape(message[:200])}")
-        # «известен с», а не «стреляет с»: firstSeenVersion глобален для issue
-        # и означает «известен с незапамятных времён», а не «начал недавно».
-        block.append(
-            f"   известен с {html.escape(row.first_seen_version)} · "
-            f"было {item.was_events} → стало {row.events_count} · "
-            f"{row.impacted_users} {plural(row.impacted_users, 'юзер', 'юзера', 'юзеров')} · "
-            f"+{item.delta}"
-        )
-        url = issue_url(project, app_id, row.issue_id)
-        block.append(f'   <a href="{url}">открыть в Crashlytics</a>')
-        block.append("")
-        blocks.append(block)
-
-    return _pack(header, blocks)
+    tail = list(growth[top:top + WEEKLY_TAIL])
+    if tail:
+        # В раскрывашке только имя-ссылка и числа: с текстом ошибки
+        # свёрнутый блок сам становится простынёй.
+        parts += [
+            "",
+            f"<details><summary>📂 Ещё {len(tail)} растущих</summary>",
+            "",
+            md.table(
+                ("Ошибка", "Было", "Стало", "Δ"),
+                [
+                    [_issue_cell(i.row, project, app_id, 0), str(i.was_events),
+                     str(i.row.events_count), f"+{i.delta}"]
+                    for i in tail
+                ],
+                "lrrr",
+            ),
+            "",
+            "</details>",
+        ]
+    return ["\n".join(parts)]

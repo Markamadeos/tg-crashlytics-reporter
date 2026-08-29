@@ -73,6 +73,11 @@ class FakeTelegram:
             raise self.error
         self.sent.extend(messages)
 
+    def send_plain(self, messages):
+        if self.error:
+            raise self.error
+        self.sent.extend(messages)
+
 
 @pytest.fixture
 def state(tmp_path):
@@ -276,6 +281,9 @@ def test_main_reports_build_deps_failure_to_channel_and_exits_1(monkeypatch):
         def send(self, messages):
             sent.extend(messages)
 
+        def send_plain(self, messages):
+            sent.extend(messages)
+
     def boom(cfg, *, telegram=None):
         raise RuntimeError("disk is read-only")
 
@@ -288,6 +296,50 @@ def test_main_reports_build_deps_failure_to_channel_and_exits_1(monkeypatch):
 
     assert code == 1
     assert sent and "disk is read-only" in sent[0]
+
+
+def test_build_deps_failure_reports_through_send_plain_not_send(monkeypatch):
+    """`main.py:298` шлёт «контейнер не запустился» через sendMessage, а не
+    rich: это может быть отказ именно rich-формата, и его обязан пережить
+    другой канал доставки.
+
+    В отличие от `test_main_reports_build_deps_failure_to_channel_and_exits_1`,
+    FakeTG здесь считает вызовы `send` и `send_plain` раздельно — общий
+    список `sent` не различает, каким методом ушло сообщение.
+    """
+    monkeypatch.setenv("CRASHLYTICS_PROJECT", "p")
+    monkeypatch.setenv("CRASHLYTICS_APP_ID", "a")
+    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "rt")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bt")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100")
+
+    calls = {"rich": 0, "plain": 0}
+
+    class FakeTG:
+        def __init__(self, *a, **kw):
+            pass
+
+        def send(self, messages):
+            calls["rich"] += 1
+
+        def send_plain(self, messages):
+            calls["plain"] += 1
+
+    def boom(cfg, *, telegram=None):
+        raise RuntimeError("disk is read-only")
+
+    monkeypatch.setattr("crashdigest.main.Telegram", FakeTG)
+    monkeypatch.setattr("crashdigest.main.build_deps", boom)
+
+    import crashdigest.main as main_mod
+
+    code = main_mod.main(["--once"])
+
+    assert code == 1
+    assert calls["plain"] == 1, "сбой старта обязан идти через sendMessage"
+    assert calls["rich"] == 0, "sendRichMessage мог сломаться сам — им нельзя сообщать о его же отказе"
 
 
 class FakeCrashlyticsWithVersions:
@@ -330,7 +382,7 @@ def test_daily_run_filters_by_recent_versions(state):
         "5.14.0 (2026072901)",
         "5.13.1 (2026063001)",
     ]
-    assert "на версиях 5.15.0, 5.14.0, 5.13.1" in tg.sent[0]
+    assert "5\\.15\\.0, 5\\.14\\.0, 5\\.13\\.1" in tg.sent[0]
 
 
 def test_weekly_report_sent_on_configured_weekday(state):
@@ -358,7 +410,9 @@ def test_weekly_report_sent_on_configured_weekday(state):
     assert weekly_prev_call[3] == expected
 
     # А в сообщении — голые версии без билдов.
-    assert "на версиях 5.15.0, 5.14.0, 5.13.1" in tg.sent[1]
+    # В новом Markdown-формате версии с экранированными точками: 5\.15\.0, 5\.14\.0, 5\.13\.1
+    # This matches the sibling daily test's strength: check the complete list, not just first version.
+    assert "5\\.15\\.0, 5\\.14\\.0, 5\\.13\\.1" in tg.sent[1]
 
 
 def test_weekly_report_not_sent_on_other_days(state):
@@ -493,3 +547,34 @@ def test_weekly_send_is_recorded_in_state(state):
              now=monday.replace(hour=11))
 
     assert not any("Фон за неделю" in m for m in tg2.sent)
+
+
+def test_startup_message_is_a_rich_table():
+    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=None)
+    assert "# 🚀 Example — контейнер запущен" in text
+    assert "| 🕐 Зона | Europe/Moscow |" in text
+    assert "| ⏱ Расписание |" in text
+    assert "ещё не было" in text
+
+
+def test_failures_go_through_send_plain(state):
+    """Сообщение об отказе обязано идти старым методом, а не rich."""
+    calls = {"rich": 0, "plain": 0}
+
+    class TG:
+        def send(self, messages):
+            calls["rich"] += 1
+
+        def send_plain(self, messages):
+            calls["plain"] += 1
+
+    class Broken(FakeCrashlyticsWithVersions):
+        def list_versions(self, start, end):
+            raise CrashlyticsError("HTTP 500")
+
+    deps = Deps(crashlytics=Broken(VERSIONS), state=state, telegram=TG())
+    with pytest.raises(CrashlyticsError):
+        run_once(CFG, deps, now=NOW)
+
+    assert calls["plain"] == 1, "об отказе сообщаем через sendMessage"
+    assert calls["rich"] == 0

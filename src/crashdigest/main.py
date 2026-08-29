@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from crashdigest import digest
+from crashdigest import digest, markdown as md
 from crashdigest.auth import TokenProvider
 from crashdigest.config import Config, ConfigError, load
 from crashdigest.crashlytics import CrashlyticsClient, CrashlyticsError
@@ -92,7 +92,7 @@ def _run(cfg: Config, deps: Deps, *, now: datetime, bootstrap: bool = False) -> 
         # Доставка сначала, состояние — только после подтверждённой отправки:
         # тот же инвариант, что и в основном пути ниже, иначе неудачная
         # отправка молча продвинет окно и первые крэши пропадут без следа.
-        deps.telegram.send(digest.render_bootstrap(len(rows), cfg.app_name))
+        deps.telegram.send(digest.render_bootstrap(len(rows), cfg.app_name, list(versions.display_versions)))
         deps.state.record(rows, now)
         deps.state.mark_success(now)
         _log(f"bootstrap: запомнено {len(rows)} issue")
@@ -106,7 +106,7 @@ def _run(cfg: Config, deps: Deps, *, now: datetime, bootstrap: bool = False) -> 
     messages = digest.render(
         new_rows, start, end,
         app_name=cfg.app_name, project=cfg.project, app_id=cfg.app_id,
-        truncated=truncated, scanned=len(rows),
+        scanned=len(rows),
         versions=list(versions.display_versions),
     )
 
@@ -193,9 +193,13 @@ def _weekly_report(cfg: Config, deps: Deps, *, now: datetime,
 
 
 def _notify_failure(deps: Deps, headline: str, detail: str) -> None:
-    """Пытается сообщить о поломке в тот же канал. Молчание — худший исход."""
+    """Пытается сообщить о поломке в тот же канал. Молчание — худший исход.
+
+    Через send_plain, а не send: если отказал именно rich-формат, сообщить
+    об этом сможет только старый метод.
+    """
     try:
-        deps.telegram.send(digest.render_error(headline, detail))
+        deps.telegram.send_plain(digest.render_error(headline, detail))
     except Exception as exc:  # noqa: BLE001
         _log(f"не удалось сообщить об ошибке в Telegram: {exc}")
 
@@ -211,12 +215,20 @@ def _startup_text(
         last_text = "ещё не было"
     else:
         last_text = last_success.astimezone(now.tzinfo).isoformat(timespec="seconds")
-    return (
-        f"🚀 <b>{html.escape(cfg.app_name)}</b>: контейнер запущен\n"
-        f"зона: {html.escape(zone)} · расписание: <code>{html.escape(cfg.schedule)}</code>\n"
-        f"следующий прогон: {next_text}\n"
-        f"последний успешный прогон: {last_text}"
-    )
+    return "\n".join([
+        f"# 🚀 {md.esc(cfg.app_name)} — контейнер запущен",
+        "",
+        md.table(
+            ("", ""),
+            [
+                ["🕐 Зона", md.esc(zone)],
+                ["⏱ Расписание", f"`{cfg.schedule}`"],
+                ["▶️ Следующий прогон", next_text],
+                ["✅ Последний успешный", last_text],
+            ],
+            "ll",
+        ),
+    ])
 
 
 def _send_startup_message(cfg: Config, deps: Deps, *, now: datetime) -> None:
@@ -283,7 +295,7 @@ def main(argv=None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         _log(f"не удалось запуститься: {detail}")
         try:
-            tg.send(digest.render_error("Контейнер не запустился", detail))
+            tg.send_plain(digest.render_error("Контейнер не запустился", detail))
         except Exception as send_exc:  # noqa: BLE001
             _log(f"не удалось сообщить о сбое старта: {send_exc}")
         return 1

@@ -4,16 +4,19 @@
         CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... \\
         python3 -m pytest tests/test_smoke.py -v
 """
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 
 from crashdigest.auth import TokenProvider
 from crashdigest.crashlytics import CrashlyticsClient
-from crashdigest.digest import render
+from crashdigest.digest import render, _split_subtitle
 from crashdigest.telegram import Telegram
 from crashdigest.versions import recent_versions
+from tests.test_crashlytics import load_fixture
 
 PROJECT = os.environ.get("CRASHLYTICS_PROJECT")
 APP_ID = os.environ.get("CRASHLYTICS_APP_ID")
@@ -106,3 +109,79 @@ def test_real_delivery_to_test_channel():
     # Без прокси доставка в этой же сети падает по не относящейся к тесту
     # причине — а именно ради этой сети и нужен TELEGRAM_PROXY в проде.
     Telegram(TEST_BOT, TEST_CHAT, proxy=os.environ.get("TELEGRAM_PROXY") or None).send(messages)
+
+
+def _send_rich_message(text: str) -> dict:
+    """POST sendRichMessage тестовому боту. Обвязка общая для обоих живых
+    rich-тестов ниже: раньше её дублировали, и прокси прокидывал только
+    один из двух вызовов — на NAS, где Telegram доступен только через
+    TELEGRAM_PROXY, второй тест молча падал бы по не относящейся к делу
+    сетевой причине.
+    """
+    proxy = os.environ.get("TELEGRAM_PROXY")
+    response = requests.post(
+        f"https://api.telegram.org/bot{TEST_BOT}/sendRichMessage",
+        data={"chat_id": TEST_CHAT,
+              "rich_message": json.dumps({"markdown": text, "skip_entity_detection": True})},
+        timeout=30,
+        proxies={"http": proxy, "https": proxy} if proxy else None,
+    )
+    body = response.json()
+    assert body["ok"], body
+    return body
+
+
+@pytest.mark.skipif(not (TEST_BOT and TEST_CHAT),
+                    reason="нужны TEST_TELEGRAM_BOT_TOKEN и TEST_TELEGRAM_CHAT_ID")
+def test_real_rich_delivery_keeps_the_link_inside_a_table_cell():
+    """Ссылка в ячейке живёт только в markdown-режиме: в blocks Telegram
+    молча её вырезает. Регрессия здесь тихая, поэтому проверяем на живом API.
+    """
+    from crashdigest import markdown as md
+
+    url = "https://example.com/i/1"
+    text = "\n".join([
+        "# Проба доставки",
+        "",
+        md.table(("Ошибка", "События"),
+                 [[md.link(md.esc("IllegalStateException"), url), "42"]],
+                 "lr"),
+    ])
+    body = _send_rich_message(text)
+    cell = body["result"]["rich_message"]["blocks"][1]["cells"][1][0]
+    # Ячейка — обёртка {"text": ..., "align": ..., "valign": ...}: сама
+    # ссылка на уровень глубже, в cell["text"] (проверено на живом ответе).
+    # Эта ячейка содержит ровно одну ссылку, поэтому cell["text"] — dict
+    # вида {"type": "url", "text": ..., "url": ...}, а не list (list бывает
+    # у ячейки с несколькими частями). Прямая индексация без .get() —
+    # нарочно: если форма ответа окажется другой, тест обязан упасть
+    # громко (KeyError/TypeError), а не молча сравнить None с None.
+    link = cell["text"]
+    assert link["url"] == url, f"ссылка вырезана или испорчена: {cell!r}"
+
+
+@pytest.mark.skipif(not (TEST_BOT and TEST_CHAT),
+                    reason="нужны TEST_TELEGRAM_BOT_TOKEN и TEST_TELEGRAM_CHAT_ID")
+def test_real_escaping_survives_round_trip_on_live_crash_subtitles():
+    """Пропущенный символ не даёт ошибки — он молча портит разметку.
+    Поэтому сверяем не глазами, а с тем, что Telegram вернул в разобранном виде.
+    """
+    from crashdigest import markdown as md
+    from crashdigest.crashlytics import parse_report
+
+    rows = parse_report(load_fixture("top_issues.json"))
+    subtitles = [_split_subtitle(r.subtitle)[1] for r in rows]
+    # < и & сюда не попадают ни из фикстуры, ни из литерала спецсимволов
+    # SPECIAL — а именно '<' был единственным символом разметки, который
+    # esc() не экранировал (Important 1 финального ревью).
+    subtitles.append(r"all specials: \ ` * _ { } [ ] ( ) # + - . ! | > ~ = < & end")
+    subtitles = [s for s in subtitles if s]
+
+    text = md.table(("Текст",), [[md.esc(s)] for s in subtitles], "l")
+    body = _send_rich_message(text)
+
+    cells = body["result"]["rich_message"]["blocks"][0]["cells"][1:]
+    assert len(cells) == len(subtitles), f"Telegram вернул {len(cells)} строк, отправили {len(subtitles)}"
+    for original, cell in zip(subtitles, cells):
+        got = cell[0]["text"]
+        assert got == original, f"разметка съела символы: {original!r} -> {got!r}"
