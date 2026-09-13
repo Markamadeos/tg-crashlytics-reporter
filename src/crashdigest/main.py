@@ -40,7 +40,7 @@ def build_deps(cfg: Config, *, telegram: object | None = None) -> Deps:
     собрать отправителя раньше State/CrashlyticsClient и сообщить об их
     отказе тем же каналом, а не голым traceback.
     """
-    tokens = TokenProvider(cfg.refresh_token, cfg.client_id, cfg.client_secret)
+    tokens = TokenProvider(cfg.credentials_path)
     return Deps(
         crashlytics=CrashlyticsClient(cfg.project, cfg.app_id, tokens),
         state=State(cfg.state_path),

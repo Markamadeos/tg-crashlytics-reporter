@@ -1,6 +1,6 @@
 """Боевая проверка против живого API. Запускается вручную:
 
-    RUN_SMOKE=1 GOOGLE_REFRESH_TOKEN=... GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \\
+    RUN_SMOKE=1 GOOGLE_APPLICATION_CREDENTIALS=... \\
         CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... \\
         python3 -m pytest tests/test_smoke.py -v
 """
@@ -20,17 +20,15 @@ from tests.test_crashlytics import load_fixture
 
 PROJECT = os.environ.get("CRASHLYTICS_PROJECT")
 APP_ID = os.environ.get("CRASHLYTICS_APP_ID")
-REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
-CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 TEST_BOT = os.environ.get("TEST_TELEGRAM_BOT_TOKEN")
 TEST_CHAT = os.environ.get("TEST_TELEGRAM_CHAT_ID")
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("RUN_SMOKE")
-    or not (PROJECT and APP_ID and REFRESH_TOKEN and CLIENT_ID and CLIENT_SECRET),
+    or not (PROJECT and APP_ID and CREDENTIALS),
     reason="боевой тест, включается RUN_SMOKE=1 + CRASHLYTICS_PROJECT/CRASHLYTICS_APP_ID/"
-           "GOOGLE_REFRESH_TOKEN/GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET",
+           "GOOGLE_APPLICATION_CREDENTIALS",
 )
 
 
@@ -43,7 +41,7 @@ def test_real_api_returns_parsed_rows_for_one_day_window():
     не проверив ни разбора полей, ни фильтра по типу — он прошёл бы даже
     против клиента, который всегда возвращает [].
     """
-    tokens = TokenProvider(REFRESH_TOKEN, CLIENT_ID, CLIENT_SECRET)
+    tokens = TokenProvider(CREDENTIALS)
     client = CrashlyticsClient(PROJECT, APP_ID, tokens)
 
     end = datetime.now(timezone.utc)
@@ -58,7 +56,7 @@ def test_real_api_returns_parsed_rows_for_one_day_window():
 
 def test_real_api_version_filter_narrows_results():
     """Фильтр по версиям обязан сужать выдачу, иначе он не работает."""
-    tokens = TokenProvider(REFRESH_TOKEN, CLIENT_ID, CLIENT_SECRET)
+    tokens = TokenProvider(CREDENTIALS)
     client = CrashlyticsClient(PROJECT, APP_ID, tokens)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=1)
@@ -87,7 +85,7 @@ def test_real_delivery_to_test_channel():
     звено, которое иначе не проверяется вовсе. Именно оно однажды отказало
     молча: прокси умер и пролежал шесть дней незамеченным.
     """
-    tokens = TokenProvider(REFRESH_TOKEN, CLIENT_ID, CLIENT_SECRET)
+    tokens = TokenProvider(CREDENTIALS)
     client = CrashlyticsClient(PROJECT, APP_ID, tokens)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=1)

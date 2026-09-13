@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,8 +21,8 @@ from crashdigest.versions import AppVersion
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc)
 
 CFG = Config(
-    project="example-prod", app_id="app-1", refresh_token="rt",
-    client_id="cid", client_secret="csecret",
+    project="example-prod", app_id="app-1",
+    credentials_path="/secrets/google-service-account.json",
     bot_token="bt", chat_id="-100", proxy=None,
     error_types=("FATAL", "ANR"), schedule="0 10 * * *",
     state_path=":memory:", app_name="Example",
@@ -167,17 +168,17 @@ def test_bootstrap_uses_ninety_day_window(state):
     assert error_types == ("FATAL", "ANR")
 
 
-def test_build_deps_uses_provided_telegram_when_given():
+def test_build_deps_uses_provided_telegram_when_given(service_account_key):
     sentinel = FakeTelegram()
-    deps = build_deps(CFG, telegram=sentinel)
+    deps = build_deps(replace(CFG, credentials_path=service_account_key), telegram=sentinel)
     try:
         assert deps.telegram is sentinel
     finally:
         deps.state.close()
 
 
-def test_build_deps_builds_default_telegram_when_not_given():
-    deps = build_deps(CFG)
+def test_build_deps_builds_default_telegram_when_not_given(service_account_key):
+    deps = build_deps(replace(CFG, credentials_path=service_account_key))
     try:
         assert deps.telegram is not None
         assert deps.telegram is not deps.crashlytics
@@ -266,9 +267,7 @@ def test_main_reports_build_deps_failure_to_channel_and_exits_1(monkeypatch):
     """
     monkeypatch.setenv("CRASHLYTICS_PROJECT", "p")
     monkeypatch.setenv("CRASHLYTICS_APP_ID", "a")
-    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "rt")
-    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
-    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/google-service-account.json")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bt")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100")
 
@@ -309,9 +308,7 @@ def test_build_deps_failure_reports_through_send_plain_not_send(monkeypatch):
     """
     monkeypatch.setenv("CRASHLYTICS_PROJECT", "p")
     monkeypatch.setenv("CRASHLYTICS_APP_ID", "a")
-    monkeypatch.setenv("GOOGLE_REFRESH_TOKEN", "rt")
-    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
-    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/google-service-account.json")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bt")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100")
 
@@ -578,3 +575,37 @@ def test_failures_go_through_send_plain(state):
 
     assert calls["plain"] == 1, "об отказе сообщаем через sendMessage"
     assert calls["rich"] == 0
+
+
+def test_main_reports_unreadable_key_to_channel_at_startup(monkeypatch, tmp_path):
+    """Ключ читается при сборке зависимостей: не смонтированный файл должен
+    прийти в канал сразу при старте, а не в плановый час прогона.
+    """
+    missing = str(tmp_path / "google-service-account.json")
+    monkeypatch.setenv("CRASHLYTICS_PROJECT", "p")
+    monkeypatch.setenv("CRASHLYTICS_APP_ID", "a")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", missing)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bt")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100")
+    monkeypatch.setenv("STATE_PATH", ":memory:")
+
+    sent = []
+
+    class FakeTG:
+        def __init__(self, *a, **kw):
+            pass
+
+        def send(self, messages):
+            sent.extend(messages)
+
+        def send_plain(self, messages):
+            sent.extend(messages)
+
+    monkeypatch.setattr("crashdigest.main.Telegram", FakeTG)
+
+    import crashdigest.main as main_mod
+
+    code = main_mod.main(["--once"])
+
+    assert code == 1
+    assert sent and missing in sent[0]

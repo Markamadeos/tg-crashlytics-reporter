@@ -4,9 +4,7 @@ from crashdigest.config import Config, ConfigError, load
 BASE = {
     "CRASHLYTICS_PROJECT": "example-prod",
     "CRASHLYTICS_APP_ID": "1:111111111111:android:0000000000000000",
-    "GOOGLE_REFRESH_TOKEN": "rt",
-    "GOOGLE_CLIENT_ID": "cid",
-    "GOOGLE_CLIENT_SECRET": "csecret",
+    "GOOGLE_APPLICATION_CREDENTIALS": "/secrets/google-service-account.json",
     "TELEGRAM_BOT_TOKEN": "bt",
     "TELEGRAM_CHAT_ID": "-1000000000000",
 }
@@ -16,6 +14,7 @@ def test_loads_required_fields_and_applies_defaults():
     cfg = load(BASE)
     assert isinstance(cfg, Config)
     assert cfg.project == "example-prod"
+    assert cfg.credentials_path == "/secrets/google-service-account.json"
     assert cfg.error_types == ("FATAL",)
     assert cfg.schedule == "0 10 * * *"
     assert cfg.app_name == "App"
@@ -36,7 +35,7 @@ def test_missing_keys_reported_all_at_once():
     with pytest.raises(ConfigError) as exc:
         load({"CRASHLYTICS_PROJECT": "p"})
     message = str(exc.value)
-    assert "GOOGLE_REFRESH_TOKEN" in message
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in message
     assert "TELEGRAM_BOT_TOKEN" in message
     assert "CRASHLYTICS_APP_ID" in message
 

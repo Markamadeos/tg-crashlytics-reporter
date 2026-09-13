@@ -9,6 +9,10 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      # Ключ сервисного аккаунта: ./secrets/google-service-account.json.
+      # Монтируется каталог, а не файл: при отсутствии файла Docker молча
+      # создал бы на его месте пустую директорию.
+      - ./secrets:/secrets:ro
     networks:
       - vpn-proxy_default
 

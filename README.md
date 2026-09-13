@@ -18,22 +18,23 @@
 Что приходит в канал:
 
 ```
-🔴 Новые падения MyApp — 3
-25.08 10:00 → 26.08 10:00
+🔴 Новые падения MyApp — 2
 
-1. java.lang.IllegalStateException
-   FragmentManager is already executing transactions
-   FATAL · 18 событий · 16 юзеров · версия 5.11.5
-   → открыть в Crashlytics
+📦 Версии: 5.15.0 (515), 5.14.1 (514), 5.14.0 (513)
+🗓 Период: 25.08 10:00 → 26.08 10:00
 
-2. android.os.DeadSystemException
-   FATAL · 29 событий · 13 юзеров · версия 5.14.0
-   → открыть в Crashlytics
+Ошибка                                              События  Юзеров
+DeadSystemException                                      29      13
+IllegalStateException                                    18      16
+FragmentManager is already executing transactions
 ```
 
-Если новых падений нет, сообщение приходит всё равно — «новых падений нет ·
-в окне 71 issue». Молчание неотличимо от сдохшего контейнера, а это худший
-способ узнать о поломке мониторинга.
+Это таблица: имя исключения — ссылка на issue в Crashlytics, под ним текст
+ошибки, строки отсортированы по числу событий.
+
+Если новых падений нет, сообщение приходит всё равно — «новых падений нет»
+и сколько issue было в окне по отслеживаемым версиям. Молчание неотличимо от
+сдохшего контейнера, а это худший способ узнать о поломке мониторинга.
 
 ## Быстрый старт
 
@@ -41,55 +42,27 @@
 
 ### 1. Доступ к Crashlytics
 
-Нужен Google-аккаунт с ролью **Firebase Crashlytics Viewer** на проекте и
-включённый в проекте API `firebasecrashlytics.googleapis.com`.
+Нужен сервисный аккаунт Google Cloud с ролью **Firebase Crashlytics Viewer** на
+проекте и включённый в проекте API `firebasecrashlytics.googleapis.com`. Других
+ролей не требуется.
 
-Сервисные аккаунты **не подойдут**: этот API их не поддерживает и отвечает
-`404 Method not found` даже при роли Owner. Поэтому авторизация идёт по
-refresh-токену живого пользователя. Берётся один раз:
-
-```bash
-npx firebase-tools login
-jq -r '.tokens.refresh_token' ~/.config/configstore/firebase-tools.json
-```
-
-Кроме самого токена нужна пара OAuth-клиента, **которому этот токен выдан**.
-Google разрешает обменивать refresh-токен только тому клиенту, что его выпустил;
-подставите чужой — получите `invalid_grant`. Токен выше выпущен клиентом
-`firebase-tools`, значит и предъявлять надо его.
-
-Клиент у `firebase-tools` публичный — он лежит открытым текстом внутри npm-пакета,
-который вы только что скачали командой выше. Достать оттуда:
+В Google Cloud Console: **IAM → Сервисные аккаунты** → создать аккаунт, выдать
+ему роль *Firebase Crashlytics Viewer*, затем в карточке аккаунта **Ключи →
+Добавить ключ → JSON**. То же через `gcloud`:
 
 ```bash
-F=$(ls "$(npm root -g)/firebase-tools/lib/api.js" \
-      ~/.npm/_npx/*/node_modules/firebase-tools/lib/api.js 2>/dev/null | head -1)
-grep -E "FIREBASE_CLIENT_ID|FIREBASE_CLIENT_SECRET" "$F"
+gcloud iam service-accounts create crashdigest --project my-app-prod
+gcloud projects add-iam-policy-binding my-app-prod \
+  --member serviceAccount:crashdigest@my-app-prod.iam.gserviceaccount.com \
+  --role roles/firebasecrashlytics.viewer
+gcloud iam service-accounts keys create google-service-account.json \
+  --iam-account crashdigest@my-app-prod.iam.gserviceaccount.com
 ```
 
-Напечатает две строки такого вида:
-
-```js
-const clientId = () => utils.envOverride("FIREBASE_CLIENT_ID", "1234...apps.googleusercontent.com");
-const clientSecret = () => utils.envOverride("FIREBASE_CLIENT_SECRET", "abcd...");
-```
-
-Второй аргумент каждой строки — то, что нужно. Первый идёт в `GOOGLE_CLIENT_ID`,
-второй в `GOOGLE_CLIENT_SECRET`.
-
-Если команда ничего не нашла, пакета ещё нет на диске: выполните
-`npx firebase-tools --version` и повторите.
-
-**Почему этих значений нет прямо в коде.** Клиент чужой. Google может его
-ротировать, `firebase-tools` тогда обновится через npm, а зашитая в наш образ
-константа протухнет молча — и дайджест умрёт с непонятной ошибкой. Переменная
-окружения чинится за минуту, правка кода требует пересборки.
-
-**Хотите свой клиент — можно.** Заведите в Google Cloud Console OAuth-клиент типа
-Desktop app, пройдите вход им же (любой стандартной OAuth-библиотекой со скоупом
-`https://www.googleapis.com/auth/cloud-platform`) и положите в эти три переменные
-свои значения. Требование ровно одно: `GOOGLE_REFRESH_TOKEN` и пара клиента
-должны быть из одного входа.
+Если создать ключ не даёт политика организации
+(`iam.disableServiceAccountKeyCreation`), это решает её администратор.
+Ключ открывает данные Crashlytics, пока его не отзовут: храните как пароль и
+не коммитьте.
 
 `app_id` лежит в `google-services.json` приложения
 (`client[].client_info.mobilesdk_app_id`) или в настройках проекта Firebase.
@@ -102,15 +75,17 @@ Desktop app, пройдите вход им же (любой стандартн�
 открыть канал в [web.telegram.org](https://web.telegram.org/k/) и взять число
 из адресной строки, вместе с минусом и префиксом `100`.
 
-### 3. Создать `.env`
+### 3. Положить ключ и создать `.env`
 
 ```bash
-mkdir -p ~/crashdigest && cd ~/crashdigest
+mkdir -p ~/crashdigest/secrets && cd ~/crashdigest
+mv /путь/к/скачанному-ключу.json secrets/google-service-account.json
+chmod 600 secrets/google-service-account.json
 cat > .env <<'EOF'
 CRASHLYTICS_PROJECT=my-app-prod
 CRASHLYTICS_APP_ID=1:123456789012:android:abcdef0123456789
 CRASHLYTICS_APP_NAME=MyApp
-GOOGLE_REFRESH_TOKEN=
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-service-account.json
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=-1001234567890
 ERROR_TYPES=FATAL
@@ -120,35 +95,48 @@ EOF
 chmod 600 .env
 ```
 
+`GOOGLE_APPLICATION_CREDENTIALS` — путь внутри контейнера: каталог `secrets`
+монтируется в `/secrets` командами ниже.
+
 ### 4. Запомнить то, что уже есть
 
 ```bash
-docker run --rm --env-file .env -v "$PWD/data:/data" \
+docker run --rm --env-file .env \
+  -v "$PWD/data:/data" -v "$PWD/secrets:/secrets:ro" \
   magw4y/tg-crashlytics-reporter --bootstrap
 ```
 
-Пройдёт по окну в 90 дней и запишет все существующие issue как известные —
-иначе первый же дайджест окажется списком из сотен позиций. В канал уйдёт одно
-сообщение со счётчиком. Занимает от секунд до нескольких минут.
+Пройдёт по окну в 90 дней и запишет как известные все issue отслеживаемых
+версий (`VERSION_WINDOW`) — иначе первый же дайджест окажется длинным списком
+того, что давно есть. В канал уйдёт одно сообщение со счётчиком. Занимает от
+секунд до нескольких минут.
 
 ### 5. Запустить
 
 ```bash
-docker run -d --name crashdigest --restart unless-stopped \
-  --env-file .env -v "$PWD/data:/data" \
+docker run -d --name crashdigest --restart unless-stopped --env-file .env \
+  -v "$PWD/data:/data" -v "$PWD/secrets:/secrets:ro" \
   magw4y/tg-crashlytics-reporter
 ```
 
 Всё. Дальше контейнер живёт сам: расписание внутри него, хосту не нужен ни
-cron, ни systemd, и его можно перенести на другую машину вместе с каталогом
-`data`.
+cron, ни systemd, и его можно перенести на другую машину вместе с каталогами
+`data` и `secrets`.
 
 Образ собирается под `linux/amd64` и `linux/arm64` — один и тот же тег
 работает и на сервере, и на Apple Silicon.
 
 ```bash
 docker logs -f crashdigest   # что происходит
-docker pull magw4y/tg-crashlytics-reporter && docker restart crashdigest   # обновиться
+```
+
+Обновиться: `docker restart` новый образ не подхватывает — контейнер нужно
+пересоздать. Состояние в `data` при этом сохраняется.
+
+```bash
+docker pull magw4y/tg-crashlytics-reporter
+docker rm -f crashdigest
+# и снова docker run из шага 5
 ```
 
 ### Через docker compose
@@ -162,24 +150,25 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      - ./secrets:/secrets:ro
 ```
 
 ```bash
 docker compose run --rm crashdigest --bootstrap   # один раз
 docker compose up -d
+docker compose pull && docker compose up -d       # обновиться
 ```
 
 ## Настройки
 
-Всё через переменные окружения — в образе нет ни одного зашитого идентификатора.
+Всё через переменные окружения и файл ключа — в образе нет ни одного зашитого
+идентификатора.
 
 | Переменная | Обяз. | По умолчанию | Что это |
 |---|:-:|---|---|
 | `CRASHLYTICS_PROJECT` | да | — | id проекта Firebase, например `my-app-prod` |
 | `CRASHLYTICS_APP_ID` | да | — | `1:123456789012:android:abcdef0123456789` |
-| `GOOGLE_REFRESH_TOKEN` | да | — | refresh-токен из `firebase-tools` |
-| `GOOGLE_CLIENT_ID` | да | — | OAuth-клиент, которому выдан токен |
-| `GOOGLE_CLIENT_SECRET` | да | — | его пара; у `firebase-tools` публичны |
+| `GOOGLE_APPLICATION_CREDENTIALS` | да | — | путь к JSON-ключу сервисного аккаунта внутри контейнера |
 | `TELEGRAM_BOT_TOKEN` | да | — | токен бота от `@BotFather` |
 | `TELEGRAM_CHAT_ID` | да | — | id канала, например `-1001234567890` |
 | `CRASHLYTICS_APP_NAME` | нет | `App` | как приложение называется в заголовке |
@@ -193,10 +182,17 @@ docker compose up -d
 | `WEEKLY_WEEKDAY` | нет | `0` | день недельного отчёта, 0 — понедельник |
 
 **Про `ERROR_TYPES`.** По умолчанию только падения. ANR стоит включать
-осознанно: в реальном приложении их бывает в десятки раз больше, чем крашей —
-на замерах 2912 ANR против 71 падения за сутки, — и новые падения утонут в
-потоке новых ANR. `NON_FATAL` включать почти наверняка не стоит: многие команды
-шлют туда технические события, и счёт идёт на сотни тысяч в сутки.
+осознанно: в реальном приложении разных ANR бывает в десятки раз больше, чем
+падений — на замерах 2912 issue с ANR против 71 с падениями за сутки, — и новые
+падения утонут в потоке новых ANR. К тому же в таблице дайджеста нет колонки
+типа: падение и ANR в ней не различить. `NON_FATAL` включать почти наверняка не
+стоит: многие команды шлют туда технические события, и счёт идёт на сотни тысяч
+событий в сутки.
+
+**Поменяли `ERROR_TYPES` или расширили `VERSION_WINDOW`** — добавленное целиком
+окажется «новым»: `--bootstrap` запоминал только то, что было задано тогда.
+Чтобы не получить таблицу из всего подряд, повторите `--bootstrap` сразу после
+очередного дайджеста — иначе он поглотит и то, что случилось с прошлого прогона.
 
 **Про `TZ`.** Задавайте явно. Без него контейнер живёт в UTC, и `0 10 * * *`
 означает не то время, которое вы имели в виду.
@@ -208,7 +204,7 @@ docker compose up -d
 
 ```bash
 IMG=magw4y/tg-crashlytics-reporter
-ARGS="--rm --env-file .env -v $PWD/data:/data"
+ARGS="--rm --env-file .env -v $PWD/data:/data -v $PWD/secrets:/secrets:ro"
 
 docker run $ARGS $IMG --once       # один прогон и выход
 docker run $ARGS $IMG --bootstrap  # запомнить текущее, ничего не перечисляя
@@ -227,16 +223,19 @@ docker run $ARGS $IMG --bootstrap  # запомнить текущее, ниче
 запуска до сейчас, с потолком в 90 дней (лимит хранения Crashlytics). Контейнер
 можно останавливать, обновлять и перевозить: пропущенный запуск не создаёт дыру,
 следующий просто накроет более широкий интервал и честно напишет период в
-заголовке.
+заголовке. Если при старте с прошлого успеха прошло больше одного периода
+расписания, дайджест собирается сразу, не дожидаясь планового часа.
 
 **Состояние двигается только после подтверждённой доставки.** Если Telegram
 недоступен, окно не сдвигается и краши не теряются — в худшем случае вы получите
 их дважды. Это осознанный выбор направления ошибки.
 
-**Отказы не бывают тихими.** Протухший токен, недоступный API, изменившаяся
-форма ответа, сбой базы, неудачная доставка — каждый случай уходит в тот же
-канал отдельным сообщением. При старте демон тоже пишет в канал: зону,
-расписание, время следующего запуска и когда был последний успех.
+**Отказы не бывают тихими.** Отозванный или не смонтированный ключ, недоступный
+API, изменившаяся форма ответа, сбой базы, отказ Telegram принять сообщение —
+каждый случай уходит в тот же канал отдельным сообщением. Исключений два:
+неполная конфигурация и полностью недоступный Telegram. Написать в канал тогда
+нечем, и причина остаётся только в `docker logs`. При старте демон тоже пишет в
+канал: зону, расписание, время следующего запуска и когда был последний успех.
 
 **Расписание — cron, а не «каждые N часов».** Второе означает, что после каждого
 перезапуска контейнера дайджест приезжает в новое время суток.
@@ -276,9 +275,12 @@ docker run $ARGS $IMG --bootstrap  # запомнить текущее, ниче
 держать обратную совместимость. Форма ответа проверяется, поэтому изменение
 схемы придёт в канал понятным сообщением, а не тишиной и не стектрейсом.
 
-**Авторизация привязана к человеку.** Пока Google не откроет сервисные аккаунты,
-дайджест живёт на refresh-токене конкретного пользователя. Потеряет доступ — вы
-об этом узнаете из канала, с инструкцией, что делать.
+**Ключ сервисного аккаунта бессрочный.** Google не отзывает его сам, если
+политика организации не задаёт срок жизни ключей, поэтому утёкший файл читает
+ваши краши до ручного отзыва. Держите роль минимальной и ротируйте ключ: новый
+файл кладётся на место старого в `secrets`, после чего контейнер нужно
+перезапустить — ключ читается при старте. Отозванный ключ придёт в канал
+сообщением с инструкцией.
 
 **Прокси.** `TELEGRAM_PROXY` нужен только там, где Telegram заблокирован. Google
 всегда запрашивается напрямую. Если прокси у вас в отдельном контейнере,
@@ -296,6 +298,11 @@ cd tg-crashlytics-reporter
 docker compose build
 ```
 
+`docker-compose.yml` в репозитории рассчитан на прокси для Telegram в отдельном
+контейнере и подключается к его внешней сети `vpn-proxy_default`. Если такой
+сети у вас нет, удалите оба блока `networks`, иначе `docker compose up` не
+запустится.
+
 ## Разработка
 
 ```bash
@@ -308,8 +315,8 @@ python3 -m venv .venv
 
 ```bash
 RUN_SMOKE=1 \
-  CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... GOOGLE_REFRESH_TOKEN=... \
-  GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
+  CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... \
+  GOOGLE_APPLICATION_CREDENTIALS=secrets/google-service-account.json \
   .venv/bin/python -m pytest tests/test_smoke.py -v
 ```
 
@@ -319,8 +326,8 @@ RUN_SMOKE=1 \
 
 ```bash
 RUN_SMOKE=1 \
-  CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... GOOGLE_REFRESH_TOKEN=... \
-  GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
+  CRASHLYTICS_PROJECT=... CRASHLYTICS_APP_ID=... \
+  GOOGLE_APPLICATION_CREDENTIALS=secrets/google-service-account.json \
   TEST_TELEGRAM_BOT_TOKEN=... TEST_TELEGRAM_CHAT_ID=... \
   .venv/bin/python -m pytest tests/test_smoke.py -v
 ```

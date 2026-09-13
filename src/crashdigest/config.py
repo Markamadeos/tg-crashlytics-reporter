@@ -9,9 +9,7 @@ from croniter import croniter
 REQUIRED = (
     "CRASHLYTICS_PROJECT",
     "CRASHLYTICS_APP_ID",
-    "GOOGLE_REFRESH_TOKEN",
-    "GOOGLE_CLIENT_ID",
-    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
 )
@@ -45,9 +43,7 @@ def _int_setting(env: Mapping[str, str], key: str, default: int,
 class Config:
     project: str
     app_id: str
-    refresh_token: str
-    client_id: str
-    client_secret: str
+    credentials_path: str
     bot_token: str
     chat_id: str
     proxy: str | None
@@ -93,9 +89,7 @@ def load(env: Mapping[str, str]) -> Config:
     return Config(
         project=env["CRASHLYTICS_PROJECT"].strip(),
         app_id=env["CRASHLYTICS_APP_ID"].strip(),
-        refresh_token=env["GOOGLE_REFRESH_TOKEN"].strip(),
-        client_id=env["GOOGLE_CLIENT_ID"].strip(),
-        client_secret=env["GOOGLE_CLIENT_SECRET"].strip(),
+        credentials_path=env["GOOGLE_APPLICATION_CREDENTIALS"].strip(),
         bot_token=env["TELEGRAM_BOT_TOKEN"].strip(),
         chat_id=env["TELEGRAM_CHAT_ID"].strip(),
         proxy=proxy,
