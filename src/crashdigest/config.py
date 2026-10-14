@@ -19,6 +19,14 @@ class ConfigError(Exception):
     """Настройки заданы неполно или неверно."""
 
 
+# Блоки события, которые разрешено прикладывать к стектрейсу в промпте.
+# `logs` в дефолт НЕ входит: строки Crashlytics.log() чаще всего и содержат
+# пользовательские данные, а разбор уходит внешнему провайдеру через шлюз.
+CONTEXT_BLOCKS = ("breadcrumbs", "logs", "custom_keys", "user")
+DEFAULT_CONTEXT = "breadcrumbs,custom_keys,user"
+DEFAULT_LLM_MODEL = "gemini-claude-opus-4-6-thinking"
+
+
 def _int_setting(env: Mapping[str, str], key: str, default: int,
                  low: int, high: int) -> int:
     """Целочисленная настройка с проверкой диапазона.
@@ -54,6 +62,24 @@ class Config:
     version_window: int
     weekly_top: int
     weekly_weekday: int
+    # Разбор краша — необязательная надстройка над дайджестом, поэтому все её
+    # поля имеют дефолты: без LLM_API_KEY конфиг собирается ровно как до неё.
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str = DEFAULT_LLM_MODEL
+    llm_timeout: int = 120
+    analyze_top: int = 5
+    crash_context: tuple[str, ...] = ("breadcrumbs", "custom_keys", "user")
+
+    @property
+    def analysis_enabled(self) -> bool:
+        """Разбор включён только при полном наборе: адрес шлюза, ключ и лимит.
+
+        Предохранитель для прода: новый образ без LLM_API_KEY в окружении
+        ведёт себя в точности как предыдущий, а не падает и не шлёт в канал
+        сообщения об отказе шлюза.
+        """
+        return bool(self.llm_base_url and self.llm_api_key and self.analyze_top)
 
 
 def load(env: Mapping[str, str]) -> Config:
@@ -86,6 +112,35 @@ def load(env: Mapping[str, str]) -> Config:
     weekly_top = _int_setting(env, "WEEKLY_TOP", 5, 1, 30)
     weekly_weekday = _int_setting(env, "WEEKLY_WEEKDAY", 0, 0, 6)
 
+    # Адрес шлюза дефолта в коде не имеет намеренно: это адрес в чужой
+    # локальной сети, а образ публичный. Значение по умолчанию живёт в
+    # docker-compose.yml, где его видно рядом с описанием сервиса.
+    llm_base_url = (env.get("LLM_BASE_URL") or "").strip().rstrip("/") or None
+    if llm_base_url and not llm_base_url.startswith(("http://", "https://")):
+        raise ConfigError(
+            f"LLM_BASE_URL должен начинаться с http:// или https://, "
+            f"получено {llm_base_url!r}"
+        )
+    llm_api_key = (env.get("LLM_API_KEY") or "").strip() or None
+    llm_model = (env.get("LLM_MODEL") or "").strip() or DEFAULT_LLM_MODEL
+    llm_timeout = _int_setting(env, "LLM_TIMEOUT", 120, 10, 600)
+    analyze_top = _int_setting(env, "ANALYZE_TOP", 5, 0, 20)
+
+    raw_context = env.get("CRASH_CONTEXT")
+    if raw_context is None:
+        raw_context = DEFAULT_CONTEXT
+    crash_context = tuple(
+        part.strip().lower() for part in raw_context.split(",") if part.strip()
+    )
+    unknown = [name for name in crash_context if name not in CONTEXT_BLOCKS]
+    if unknown:
+        # Опечатка в имени блока иначе молча обеднила бы промпт: разбор стал
+        # бы хуже без единого признака, что настройка не применилась.
+        raise ConfigError(
+            "CRASH_CONTEXT содержит неизвестные блоки: " + ", ".join(unknown)
+            + "; допустимы: " + ", ".join(CONTEXT_BLOCKS)
+        )
+
     return Config(
         project=env["CRASHLYTICS_PROJECT"].strip(),
         app_id=env["CRASHLYTICS_APP_ID"].strip(),
@@ -100,4 +155,10 @@ def load(env: Mapping[str, str]) -> Config:
         version_window=version_window,
         weekly_top=weekly_top,
         weekly_weekday=weekly_weekday,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_timeout=llm_timeout,
+        analyze_top=analyze_top,
+        crash_context=crash_context,
     )

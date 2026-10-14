@@ -4,9 +4,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from crashdigest.config import Config
-from crashdigest.crashlytics import CrashlyticsError, IssueRow
+from crashdigest.crashlytics import (
+    CrashEvent,
+    CrashlyticsError,
+    EventException,
+    EventFrame,
+    IssueRow,
+)
 from crashdigest.main import (
     Deps,
+    _analyze_one,
     _catch_up_due,
     _run_startup_catch_up,
     _send_startup_message,
@@ -40,6 +47,49 @@ def row(issue_id):
 
 DEFAULT_FAKE_VERSIONS = [AppVersion("1.0.0", "1", "1.0.0 (1)")]
 
+DEFAULT_FAKE_EVENT = CrashEvent(
+    event_time="2026-08-26T09:00:00Z", platform="ANDROID",
+    issue_title="SourceFile - a.b", issue_subtitle="cls - msg",
+    exceptions=(EventException(
+        type="java.lang.IllegalStateException", message="msg",
+        frames=(EventFrame("com.example.Foo.bar", "Foo.kt", "10", "",
+                           "DEVELOPER", True),),
+        blamed=True, nested=False),),
+    threads=(), blame_frame=None, app_version="5.15.0 (515)",
+    device="Redmi 9", operating_system="Android (11)", os_version="11", memory="",
+    process_state="FOREGROUND", orientation="portrait",
+    breadcrumbs=(), logs=(), custom_keys=(), user="",
+)
+
+ANSWER = {"what_happened": "сломалось", "likely_cause": "потому что",
+          "checks": ["проверить раз", "проверить два"]}
+
+# Разбор включён: есть адрес шлюза, ключ и лимит. Лимит 2 — чтобы на трёх
+# новых падениях было видно, что он соблюдается.
+CFG_ANALYSIS = replace(
+    CFG, llm_base_url="http://gw:3000/v1", llm_api_key="ag-key",
+    llm_model="model-x", analyze_top=2,
+)
+
+
+class FakeLlm:
+    def __init__(self, answer=None, error=None, answers=None):
+        self.answer = ANSWER if answer is None else answer
+        self.answers = answers
+        self.error = error
+        self.prompts = []
+
+    def json_object(self, system, user):
+        self.prompts.append(user)
+        if self.answers is not None:
+            item = self.answers.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        if self.error:
+            raise self.error
+        return self.answer
+
 
 class FakeCrashlytics:
     """Версии по умолчанию непустые: `_tracked_versions` теперь считается на
@@ -48,11 +98,21 @@ class FakeCrashlytics:
     не должны спотыкаться об эту проверку.
     """
 
-    def __init__(self, rows=None, error=None, versions=None):
+    def __init__(self, rows=None, error=None, versions=None, events=None,
+                 event_error=None):
         self.rows = rows or []
         self.error = error
         self.calls = []
         self.versions = DEFAULT_FAKE_VERSIONS if versions is None else versions
+        self.events = events or {}
+        self.event_error = event_error
+        self.event_calls = []
+
+    def sample_event(self, issue_id, start, end, *, context):
+        self.event_calls.append((issue_id, context))
+        if self.event_error:
+            raise self.event_error
+        return self.events.get(issue_id, DEFAULT_FAKE_EVENT)
 
     def top_issues(self, start, end, error_types, versions=None):
         self.calls.append((start, end, error_types))
@@ -65,19 +125,53 @@ class FakeCrashlytics:
 
 
 class FakeTelegram:
-    def __init__(self, error=None):
+    """`linked`/`forward_id`/`cursor_error` настраивают путь комментариев;
+    `trace` хранит порядок вызовов — он сам по себе инвариант (курсор обязан
+    сниматься до отправки поста).
+    """
+
+    def __init__(self, error=None, linked="-1002222", forward_id=42,
+                 cursor_error=None, comment_error=None):
         self.sent = []
+        self.comments = []
+        self.trace = []
         self.error = error
+        self.linked = linked
+        self.forward_id = forward_id
+        self.cursor_error = cursor_error
+        self.comment_error = comment_error
 
     def send(self, messages):
         if self.error:
             raise self.error
+        self.trace.append("send")
         self.sent.extend(messages)
+        return [1000 + index for index, _ in enumerate(messages)]
 
     def send_plain(self, messages):
         if self.error:
             raise self.error
         self.sent.extend(messages)
+
+    def linked_chat_id(self):
+        self.trace.append("linked")
+        return self.linked
+
+    def updates_cursor(self):
+        self.trace.append("cursor")
+        if self.cursor_error:
+            raise self.cursor_error
+        return 7
+
+    def find_discussion_copy(self, post_id, *, cursor):
+        self.trace.append(("find", post_id, cursor))
+        return self.forward_id
+
+    def send_comment(self, message, *, chat_id, reply_to):
+        if self.comment_error:
+            raise self.comment_error
+        self.trace.append("comment")
+        self.comments.append((message, chat_id, reply_to))
 
 
 @pytest.fixture
@@ -182,6 +276,27 @@ def test_build_deps_builds_default_telegram_when_not_given(service_account_key):
     try:
         assert deps.telegram is not None
         assert deps.telegram is not deps.crashlytics
+    finally:
+        deps.state.close()
+
+
+def test_build_deps_wires_llm_client_from_config(service_account_key):
+    """Проводка config → LlmClient: адрес, ключ и модель должны доехать до
+    клиента, иначе параметр compose не управляет ничем."""
+    cfg = replace(CFG_ANALYSIS, credentials_path=service_account_key)
+    deps = build_deps(cfg, telegram=FakeTelegram())
+    try:
+        assert deps.llm is not None
+        assert deps.llm.model == "model-x"
+    finally:
+        deps.state.close()
+
+
+def test_build_deps_leaves_llm_unset_when_analysis_is_off(service_account_key):
+    deps = build_deps(replace(CFG, credentials_path=service_account_key),
+                      telegram=FakeTelegram())
+    try:
+        assert deps.llm is None
     finally:
         deps.state.close()
 
@@ -609,3 +724,233 @@ def test_main_reports_unreadable_key_to_channel_at_startup(monkeypatch, tmp_path
 
     assert code == 1
     assert sent and missing in sent[0]
+
+
+# --- разбор крашей в комментариях ------------------------------------------
+
+def analysis_deps(state, *, rows=None, tg=None, llm=None, crashlytics=None):
+    return Deps(
+        crashlytics=crashlytics or FakeCrashlytics(rows if rows is not None else [row("id1")]),
+        state=state,
+        telegram=tg or FakeTelegram(),
+        llm=llm or FakeLlm(),
+    )
+
+
+def test_comment_is_posted_under_the_digest_post(state):
+    tg, llm = FakeTelegram(), FakeLlm()
+    deps = analysis_deps(state, tg=tg, llm=llm)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert len(tg.comments) == 1
+    message, chat_id, reply_to = tg.comments[0]
+    assert chat_id == "-1002222"        # группа обсуждений, не канал
+    assert reply_to == 42               # автофорвард поста, не сам пост
+    assert "Что произошло" in message
+    assert "сломалось" in message
+
+
+def test_cursor_is_taken_before_the_post_is_sent(state):
+    """Иначе автофорвард может прийти раньше, чем мы узнаем, с какого места
+    смотреть обновления, — и мы его не увидим."""
+    tg = FakeTelegram()
+    run_once(CFG_ANALYSIS, analysis_deps(state, tg=tg), now=NOW)
+    assert tg.trace.index("cursor") < tg.trace.index("send")
+
+
+def test_analysis_respects_the_limit(state):
+    rows = [row("id1"), row("id2"), row("id3")]
+    tg = FakeTelegram()
+    deps = analysis_deps(state, rows=rows, tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert len(tg.comments) == CFG_ANALYSIS.analyze_top == 2
+
+
+def test_configured_context_reaches_the_parser(state):
+    """CRASH_CONTEXT — единственный рубеж приватности: readMask живой API не
+    принимает, и отбор блоков делает parse_event по этому значению."""
+    crashlytics = FakeCrashlytics([row("id1")])
+    deps = analysis_deps(state, crashlytics=crashlytics)
+
+    run_once(replace(CFG_ANALYSIS, crash_context=("logs",)), deps, now=NOW)
+
+    _, context = crashlytics.event_calls[0]
+    assert context == ("logs",)
+
+
+def test_one_broken_analysis_does_not_lose_the_others(state):
+    """Поштучная изоляция: один отказ шлюза не должен лишить разбора
+    остальные падения того же прогона."""
+    tg = FakeTelegram()
+    llm = FakeLlm(answers=[RuntimeError("шлюз икнул"), ANSWER])
+    deps = analysis_deps(state, rows=[row("id1"), row("id2")], tg=tg, llm=llm)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert len(tg.comments) == 1
+    assert not any("не собран" in m for m in tg.sent)   # в канал не паникуем
+
+
+def test_issue_without_sample_event_is_skipped_quietly(state):
+    tg = FakeTelegram()
+    crashlytics = FakeCrashlytics([row("id1")], events={"id1": None})
+    deps = analysis_deps(state, tg=tg, crashlytics=crashlytics)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert tg.comments == []
+    assert any("Новые падения" in m for m in tg.sent)
+
+
+def test_digest_survives_channel_without_discussion_group(state):
+    """Главный инвариант: разбор — надстройка. Его отказ не отменяет ни
+    доставленный пост, ни зафиксированное состояние."""
+    tg = FakeTelegram(linked=None)
+    deps = analysis_deps(state, tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert any("Новые падения" in m for m in tg.sent)
+    assert any("Разбор крашей не собран" in m for m in tg.sent)
+    assert tg.comments == []
+    assert state.last_success_at() is not None
+
+
+def test_digest_survives_missing_automatic_forward(state):
+    tg = FakeTelegram(forward_id=None)
+    deps = analysis_deps(state, tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert any("Новые падения" in m for m in tg.sent)
+    assert any("Разбор крашей не собран" in m for m in tg.sent)
+    assert state.last_success_at() is not None
+
+
+def test_failure_message_names_the_admin_rights_cause(state):
+    tg = FakeTelegram(forward_id=None)
+    run_once(CFG_ANALYSIS, analysis_deps(state, tg=tg), now=NOW)
+    assert any("не админ в группе обсуждений" in m for m in tg.sent)
+
+
+def test_digest_survives_unreachable_updates_api(state):
+    """getUpdates нужен только разбору. Пост с таблицей обязан уйти даже при
+    висящем webhook'е — иначе новая возможность ломает старую."""
+    tg = FakeTelegram(cursor_error=RuntimeError("webhook активен"))
+    deps = analysis_deps(state, tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert any("Новые падения" in m for m in tg.sent)
+    assert state.last_success_at() is not None
+
+
+def test_sample_event_failure_does_not_break_the_run(state):
+    tg = FakeTelegram()
+    crashlytics = FakeCrashlytics([row("id1")],
+                                 event_error=CrashlyticsError("403"))
+    deps = analysis_deps(state, tg=tg, crashlytics=crashlytics)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert any("Новые падения" in m for m in tg.sent)
+    assert state.last_success_at() is not None
+    assert tg.comments == []
+
+
+def test_analysis_disabled_touches_nothing(state):
+    """Предохранитель для прода: без ключа шлюза контейнер обязан вести себя
+    в точности как до появления разбора."""
+    tg, llm = FakeTelegram(), FakeLlm()
+    crashlytics = FakeCrashlytics([row("id1")])
+    deps = Deps(crashlytics=crashlytics, state=state, telegram=tg, llm=llm)
+
+    run_once(CFG, deps, now=NOW)       # CFG без LLM_API_KEY
+
+    assert tg.comments == []
+    assert llm.prompts == []
+    assert crashlytics.event_calls == []
+    assert "cursor" not in tg.trace and "linked" not in tg.trace
+
+
+def test_bootstrap_does_not_analyze(state):
+    tg = FakeTelegram()
+    deps = analysis_deps(state, tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW, bootstrap=True)
+
+    assert tg.comments == []
+
+
+def test_no_new_crashes_means_no_comments(state):
+    tg = FakeTelegram()
+    deps = analysis_deps(state, rows=[], tg=tg)
+
+    run_once(CFG_ANALYSIS, deps, now=NOW)
+
+    assert tg.comments == []
+    # Курсор в тихие сутки не снимается вовсе: разбирать нечего, и запрос был
+    # бы ежедневной тратой, умеющей отказывать на пустом месте.
+    assert "cursor" not in tg.trace
+
+
+def test_startup_message_shows_model_when_analysis_is_on():
+    """Модель задаётся параметром compose. Контейнер, поднявшийся не с той
+    моделью, иначе ничем себя не выдаёт — та же причина, что у печати зоны."""
+    text = _startup_text(CFG_ANALYSIS, zone="Europe/Moscow", now=NOW,
+                         last_success=None)
+    assert "model-x" in text
+    assert "до 2 на прогон" in text
+
+
+def test_startup_message_stays_silent_about_disabled_analysis():
+    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=None)
+    assert "Разбор" not in text
+
+
+# --- отладочный путь --analyze --------------------------------------------
+
+def test_analyze_one_prints_without_sending(state, capsys):
+    tg = FakeTelegram()
+    deps = analysis_deps(state, tg=tg)
+
+    assert _analyze_one(CFG_ANALYSIS, deps, "id1", now=NOW, dry_run=True) == 0
+
+    assert "Что произошло" in capsys.readouterr().out
+    assert tg.sent == [] and tg.comments == []
+
+
+def test_analyze_one_sends_as_plain_message(state):
+    """У разбора по требованию нет поста, под которым он был бы
+    комментарием, — уходит обычным сообщением."""
+    tg = FakeTelegram()
+    deps = analysis_deps(state, tg=tg)
+
+    assert _analyze_one(CFG_ANALYSIS, deps, "id1", now=NOW, dry_run=False) == 0
+
+    assert len(tg.sent) == 1 and "Что произошло" in tg.sent[0]
+    assert tg.comments == []
+
+
+def test_analyze_one_uses_real_issue_numbers(state):
+    deps = analysis_deps(state, rows=[row("id1")])
+    _analyze_one(CFG_ANALYSIS, deps, "id1", now=NOW, dry_run=True)
+    assert "Событий: 5, затронуто пользователей: 3" in deps.llm.prompts[0]
+
+
+def test_analyze_one_works_for_issue_absent_from_report(state, capsys):
+    """Руками разбирают как раз то, чего нет в отслеживаемых версиях. Отсутствие
+    строки отчёта обедняет числа, но не отменяет разбор по стектрейсу."""
+    deps = analysis_deps(state, rows=[row("other")])
+
+    assert _analyze_one(CFG_ANALYSIS, deps, "id1", now=NOW, dry_run=True) == 0
+    assert "Что произошло" in capsys.readouterr().out
+
+
+def test_analyze_one_reports_when_no_event_found(state):
+    crashlytics = FakeCrashlytics([row("id1")], events={"id1": None})
+    deps = analysis_deps(state, crashlytics=crashlytics)
+    assert _analyze_one(CFG_ANALYSIS, deps, "id1", now=NOW, dry_run=True) == 1

@@ -7,6 +7,22 @@ services:
     container_name: crashdigest
     restart: unless-stopped
     env_file: .env
+    # Провайдер моделей и выбор модели — параметры здесь, а не только в .env:
+    # модель крутят чаще всего остального, и видно её должно быть рядом с
+    # описанием сервиса. Переопределяется без правки файла:
+    #   LLM_MODEL=gemini-claude-sonnet-4-6 docker compose up -d
+    # LLM_API_KEY сюда НЕ попадает: этот файл лежит в git, ключ живёт в .env
+    # и приезжает через env_file выше.
+    environment:
+      # LLM_BASE_URL и LLM_API_KEY здесь НЕ перечислены намеренно: они
+      # приезжают через env_file. Подстановка ${...} читает .env рядом с
+      # этим файлом, а НЕ env_file выше, и в сервисе с другим env-файлом
+      # пустая подстановка молча перебила бы заданный адрес (environment
+      # приоритетнее env_file) и так же молча выключила бы разбор.
+      LLM_MODEL: ${LLM_MODEL:-gemini-claude-opus-4-6-thinking}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
+      ANALYZE_TOP: ${ANALYZE_TOP:-5}
+      CRASH_CONTEXT: ${CRASH_CONTEXT:-breadcrumbs,custom_keys,user}
     volumes:
       - ./data:/data
       # Ключ сервисного аккаунта: ./secrets/google-service-account.json.

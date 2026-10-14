@@ -227,3 +227,238 @@ class CrashlyticsClient:
                     )
                 return rows
             params = {**params, "pageToken": token}
+
+    def sample_event(self, issue_id: str, start: datetime, end: datetime,
+                     *, context: Sequence[str] = ()) -> CrashEvent | None:
+        """Самое свежее событие issue — ради стектрейса и обстановки.
+
+        pageSize=1: разбору нужен один представитель, а не выборка. События
+        отсортированы по убыванию времени, значит первое — последнее по времени,
+        то есть снятое с самой свежей сборки из попавших в окно.
+        """
+        url = f"{API_BASE}/projects/{self._project}/apps/{self._app_id}/events"
+        params = {
+            "filter.issue.id": issue_id,
+            "filter.interval.startTime": _rfc3339(start, "start"),
+            "filter.interval.endTime": _rfc3339(end, "end"),
+            "pageSize": "1",
+        }
+        headers = {"Authorization": f"Bearer {self._tokens.token()}"}
+
+        response = self._session.get(url, params=params, headers=headers, timeout=90)
+        if response.status_code == 403:
+            # Дайджесту хватает роли Firebase Crashlytics Viewer, а events.list
+            # — отдельное разрешение. Отличаем эту причину явно: иначе «403» на
+            # ровном месте выглядит как отозванный ключ.
+            raise CrashlyticsError(
+                "Crashlytics вернул HTTP 403 на events.list — роли сервисного "
+                "аккаунта не хватает на чтение событий (стектрейсов). "
+                "Дайджест при этом работает: ему достаточно reports. "
+                f"{response.text[:200]}"
+            )
+        if response.status_code != 200:
+            raise CrashlyticsError(
+                f"Crashlytics вернул HTTP {response.status_code} на events.list: "
+                f"{response.text[:200]}"
+            )
+        return parse_event(response.json(), context=context)
+
+
+# --- Сэмпл события: стектрейс и обстановка вокруг краша ---------------------
+
+# ВНИМАНИЕ: параметра readMask у этого метода фактически нет. Discovery-документ
+# v1alpha его описывает, но живой API отвечает 400 INVALID_ARGUMENT на ЛЮБОЕ
+# его значение — проверено на проде: `exceptions`, `exceptions,blameFrame`,
+# полная маска, snake_case, `*`. Без него тот же запрос отдаёт событие целиком.
+# Поэтому событие всегда приезжает полностью, со всеми логами и крошками, а
+# отбор того, что разрешено показывать модели, делает `parse_event` ниже —
+# другого рубежа для него не осталось.
+#
+# Обязателен же здесь `filter.issue.id`: без него метод тоже отвечает 400.
+
+# Сколько элементов хвоста контекста оставляем. Крошек и логов в сессии бывают
+# сотни, а для «что делал юзер перед падением» хватает последних.
+CONTEXT_TAIL = 15
+
+
+@dataclass(frozen=True)
+class EventFrame:
+    symbol: str
+    file: str
+    line: str
+    library: str
+    owner: str
+    blamed: bool
+
+    @property
+    def where(self) -> str:
+        """`symbol (file:line)` — ровно то, что видно в консоли Crashlytics."""
+        place = ":".join(part for part in (self.file, self.line) if part)
+        return f"{self.symbol} ({place})" if place else self.symbol
+
+
+@dataclass(frozen=True)
+class EventException:
+    type: str
+    message: str
+    frames: tuple[EventFrame, ...]
+    blamed: bool
+    nested: bool
+
+
+@dataclass(frozen=True)
+class EventThread:
+    name: str
+    signal: str
+    crashed: bool
+    blamed: bool
+    frames: tuple[EventFrame, ...]
+
+
+@dataclass(frozen=True)
+class CrashEvent:
+    event_time: str
+    platform: str
+    issue_title: str
+    issue_subtitle: str
+    exceptions: tuple[EventException, ...]
+    threads: tuple[EventThread, ...]
+    blame_frame: EventFrame | None
+    app_version: str
+    device: str
+    operating_system: str
+    os_version: str
+    memory: str
+    process_state: str
+    orientation: str
+    breadcrumbs: tuple[str, ...]
+    logs: tuple[str, ...]
+    custom_keys: tuple[tuple[str, str], ...]
+    user: str
+
+
+def _text(value) -> str:
+    """Строка или пусто. Ни одно поле события не обязано присутствовать."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _mapping(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _items(value) -> list:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _parse_frames(raw) -> tuple[EventFrame, ...]:
+    return tuple(
+        EventFrame(
+            symbol=_text(frame.get("symbol")),
+            file=_text(frame.get("file")),
+            line=_text(frame.get("line")),
+            library=_text(frame.get("library")),
+            owner=_text(frame.get("owner")) or "UNKNOWN",
+            blamed=bool(frame.get("blamed")),
+        )
+        for frame in _items(raw)
+    )
+
+
+def _parse_memory(raw) -> str:
+    """«свободно/использовано» в мегабайтах. Пусто, если чисел нет."""
+    memory = _mapping(raw)
+    parts = []
+    for key, label in (("free", "свободно"), ("used", "использовано")):
+        try:
+            parts.append(f"{label} {int(memory[key]) // (1024 * 1024)} МБ")
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ", ".join(parts)
+
+
+def parse_event(payload: dict, *, context: Sequence[str] = ()) -> CrashEvent | None:
+    """Первое событие из ответа events.list. Чистая функция.
+
+    НАМЕРЕННО снисходительна, в отличие от строгой `parse_report` рядом. У той
+    строгость оправдана: молча испорченные числа в дайджесте хуже падения. Здесь
+    наоборот — разбор это необязательная надстройка над уже доставленным постом,
+    и пропавшее поле обязано обеднить разбор, а не уронить дневной прогон.
+
+    `context` — имена блоков из CRASH_CONTEXT, которые разрешено оставить
+    (`breadcrumbs`, `logs`, `custom_keys`, `user`). Неразрешённые выбрасываются
+    ЗДЕСЬ, а не при сборке промпта: readMask живым API не поддерживается (см.
+    комментарий выше), событие приезжает целиком, и чем раньше лишнее выпадет,
+    тем меньше мест, где оно может всплыть — в логе, в тексте исключения, в
+    repr датакласса. Собранный CrashEvent не хранит того, чего не должен.
+    """
+    events = _items(_mapping(payload).get("events"))
+    if not events:
+        return None
+    event = events[0]
+    allowed = set(context)
+
+    exceptions = tuple(
+        EventException(
+            type=_text(item.get("type")),
+            message=_text(item.get("exceptionMessage")) or _text(item.get("subtitle")),
+            frames=_parse_frames(item.get("frames")),
+            blamed=bool(item.get("blamed")),
+            nested=bool(item.get("nested")),
+        )
+        for item in _items(event.get("exceptions"))
+    )
+
+    # Невиноватые потоки не сохраняем вовсе: их в событии десятки, разбору нужен
+    # только упавший, и держать остальные ради «полноты» означало бы тащить
+    # мегабайт фреймов через весь модуль до места, где они будут выброшены.
+    threads = tuple(
+        EventThread(
+            name=_text(item.get("name")) or _text(item.get("title")),
+            signal=_text(item.get("signal")),
+            crashed=bool(item.get("crashed")),
+            blamed=bool(item.get("blamed")),
+            frames=_parse_frames(item.get("frames")),
+        )
+        for item in _items(event.get("threads"))
+        if item.get("blamed") or item.get("crashed")
+    )
+
+    blame = _parse_frames([event.get("blameFrame")] if event.get("blameFrame") else [])
+
+    return CrashEvent(
+        event_time=_text(event.get("eventTime")),
+        platform=_text(event.get("platform")),
+        issue_title=_text(event.get("issueTitle")),
+        issue_subtitle=_text(event.get("issueSubtitle")),
+        exceptions=exceptions,
+        threads=threads,
+        blame_frame=blame[0] if blame else None,
+        app_version=_text(_mapping(event.get("version")).get("displayName")),
+        device=(
+            _text(_mapping(event.get("device")).get("marketingName"))
+            or _text(_mapping(event.get("device")).get("displayName"))
+        ),
+        operating_system=_text(_mapping(event.get("operatingSystem")).get("displayName")),
+        # Отдельно от displayName: у боевого приложения тот приходит как
+        # `Unknown (13)` — имя ОС Google не определил, а версию определил.
+        # Имея версию и платформу по отдельности, можно не печатать `Unknown`.
+        os_version=_text(_mapping(event.get("operatingSystem")).get("displayVersion")),
+        memory=_parse_memory(event.get("memory")),
+        process_state=_text(event.get("processState")),
+        orientation=_text(event.get("appOrientation")),
+        breadcrumbs=tuple(
+            name for name in (
+                _text(item.get("title")) for item in _items(event.get("breadcrumbs"))
+            ) if name
+        )[-CONTEXT_TAIL:] if "breadcrumbs" in allowed else (),
+        logs=tuple(
+            line for line in (
+                _text(item.get("message")) for item in _items(event.get("logs"))
+            ) if line
+        )[-CONTEXT_TAIL:] if "logs" in allowed else (),
+        custom_keys=tuple(
+            (str(key), str(value))
+            for key, value in _mapping(event.get("customKeys")).items()
+        )[:CONTEXT_TAIL] if "custom_keys" in allowed else (),
+        user=_text(_mapping(event.get("user")).get("id")) if "user" in allowed else "",
+    )
