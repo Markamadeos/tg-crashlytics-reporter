@@ -1,0 +1,70 @@
+{
+  "events": [
+    {
+      "name": "projects/example-prod/apps/1:111:android:0000/events/abc123",
+      "eventId": "abc123",
+      "eventTime": "2026-10-13T21:14:07Z",
+      "platform": "ANDROID",
+      "issueTitle": "SourceFile - B1.g$a$a.a",
+      "issueSubtitle": "java.lang.IllegalStateException - FragmentManager is already executing transactions",
+      "processState": "FOREGROUND",
+      "appOrientation": "portrait",
+      "version": {
+        "displayVersion": "5.15.0",
+        "buildVersion": "515",
+        "displayName": "5.15.0 (515)"
+      },
+      "device": {
+        "manufacturer": "Xiaomi",
+        "model": "M2004J19C",
+        "marketingName": "Redmi 9",
+        "displayName": "Xiaomi (M2004J19C)",
+        "formFactor": "PHONE"
+      },
+      "operatingSystem": {
+        "os": "Android",
+        "displayVersion": "11",
+        "displayName": "Android (11)",
+        "deviceType": "mobile"
+      },
+      "memory": {"free": "125829120", "used": "1887436800"},
+      "blameFrame": {
+        "symbol": "com.example.app.profile.ProfileFragment.onResume",
+        "file": "ProfileFragment.kt",
+        "line": "142",
+        "owner": "DEVELOPER",
+        "blamed": true
+      },
+      "exceptions": [
+        {
+          "type": "java.lang.IllegalStateException",
+          "exceptionMessage": "FragmentManager is already executing transactions",
+          "title": "SourceFile",
+          "subtitle": "B1.g$a$a.a",
+          "blamed": true,
+          "nested": false,
+          "frames": [
+            {"symbol": "androidx.fragment.app.FragmentManager.<init>", "file": "FragmentManager.java", "line": "1823", "owner": "VENDOR"},
+            {"symbol": "com.example.app.profile.ProfileFragment.onResume", "file": "ProfileFragment.kt", "line": "142", "owner": "DEVELOPER", "blamed": true},
+            {"symbol": "androidx.fragment.app.Fragment.performResume", "file": "Fragment.java", "line": "3036", "owner": "VENDOR"},
+            {"symbol": "android.os.Looper.loop", "file": "Looper.java", "line": "223", "owner": "PLATFORM"},
+            {"symbol": "com.android.internal.os.ZygoteInit.main", "file": "ZygoteInit.java", "line": "947", "owner": "SYSTEM"}
+          ]
+        }
+      ],
+      "threads": [
+        {"name": "main", "crashed": true, "blamed": true, "frames": [
+          {"symbol": "android.os.MessageQueue.nativePollOnce", "file": "MessageQueue.java", "line": "-2", "owner": "PLATFORM"}
+        ]},
+        {"name": "FinalizerDaemon", "crashed": false, "blamed": false, "frames": []}
+      ],
+      "breadcrumbs": [
+        {"title": "screen_view", "eventTime": "2026-10-13T21:13:51Z", "params": {"screen_name": "catalog"}},
+        {"title": "select_item", "eventTime": "2026-10-13T21:14:02Z"},
+        {"title": "screen_view", "eventTime": "2026-10-13T21:14:06Z", "params": {"screen_name": "profile"}}
+      ],
+      "customKeys": {"auth_state": "logged_in", "experiment": "profile_v2"},
+      "user": {"id": "u-90210"}
+    }
+  ]
+}

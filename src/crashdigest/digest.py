@@ -73,10 +73,6 @@ def _head(versions: Sequence[str] | None, period: str) -> str:
     return "<br>".join(lines)
 
 
-def _short(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 def _issue_cell(row: IssueRow, project: str, app_id: str, msg_limit: int) -> str:
     """Имя класса — ссылка на issue, под ним текст ошибки.
 
@@ -85,11 +81,11 @@ def _issue_cell(row: IssueRow, project: str, app_id: str, msg_limit: int) -> str
     """
     cls, message = _split_subtitle(row.subtitle)
     name = md.link(
-        md.esc(_short(cls.rsplit(".", 1)[-1] or cls, 30)),
+        md.esc(md.short(cls.rsplit(".", 1)[-1] or cls, 30)),
         issue_url(project, app_id, row.issue_id),
     )
     if message and msg_limit:
-        return f"{name}<br>{md.esc(_short(message, msg_limit))}"
+        return f"{name}<br>{md.esc(md.short(message, msg_limit))}"
     return name
 
 

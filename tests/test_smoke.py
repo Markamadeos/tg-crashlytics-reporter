@@ -183,3 +183,67 @@ def test_real_escaping_survives_round_trip_on_live_crash_subtitles():
     for original, cell in zip(subtitles, cells):
         got = cell[0]["text"]
         assert got == original, f"разметка съела символы: {original!r} -> {got!r}"
+
+
+# --- стектрейсы: events.list ----------------------------------------------
+
+def test_real_api_returns_stacktrace_for_a_live_issue():
+    """Единственный способ узнать, покрывает ли роль сервисного аккаунта
+    events.list.
+
+    Дайджесту хватает reports, а стектрейсы — отдельное разрешение, и 403
+    здесь означает «разбор в проде не заработает», что надо знать ДО
+    включения, а не из сообщения об отказе в канале.
+    """
+    tokens = TokenProvider(CREDENTIALS)
+    client = CrashlyticsClient(PROJECT, APP_ID, tokens)
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=1)
+    rows = client.top_issues(start, end, ("FATAL",))
+    assert rows, "нет живых issue за сутки — проверять стектрейс не на чем"
+
+    event = client.sample_event(
+        rows[0].issue_id, start, end,
+        context=("breadcrumbs", "custom_keys", "user"),
+    )
+
+    assert event is not None, "у живого issue не нашлось ни одного события"
+    assert event.platform, "платформа события пуста — схема events.list изменилась"
+
+    frames = [f for e in event.exceptions for f in e.frames]
+    frames += [f for t in event.threads for f in t.frames]
+    if event.blame_frame:
+        frames.append(event.blame_frame)
+    assert frames, "событие без единого фрейма — разбирать было бы нечего"
+    assert any(f.symbol or f.library for f in frames)
+    # THIRD_PARTY в схеме Frame.owner не описан — он пришёл с живого API.
+    assert {f.owner for f in frames} <= {
+        "DEVELOPER", "VENDOR", "RUNTIME", "PLATFORM", "SYSTEM", "THIRD_PARTY",
+        "UNKNOWN",
+    }
+
+
+def test_real_api_context_filter_holds_on_live_payload():
+    """Отбор блоков обязан работать на ЖИВОМ событии, а не только на фикстуре.
+
+    Это не оптимизация, а единственный рубеж приватности: readMask живой API
+    отвергает (400 на любое значение), событие приезжает целиком со всеми
+    логами, и не уехать им в модель мешает только `context`.
+    """
+    tokens = TokenProvider(CREDENTIALS)
+    client = CrashlyticsClient(PROJECT, APP_ID, tokens)
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=1)
+    rows = client.top_issues(start, end, ("FATAL",))
+    assert rows
+
+    event = client.sample_event(rows[0].issue_id, start, end)
+    assert event is not None
+    assert event.logs == (), "логи остались в событии, хотя не разрешены"
+    assert event.breadcrumbs == ()
+    assert event.custom_keys == ()
+    assert event.user == ""
+    # Стектрейс при этом на месте: контекст отобран, разбор не обеднён до нуля.
+    assert event.exceptions or event.threads or event.blame_frame
