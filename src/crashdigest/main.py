@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import html
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from crashdigest import analysis, digest, markdown as md
+from crashdigest import analysis, digest
 from crashdigest.auth import TokenProvider
 from crashdigest.config import Config, ConfigError, load
 from crashdigest.crashlytics import CrashlyticsClient, CrashlyticsError, IssueRow
@@ -16,6 +15,7 @@ from crashdigest.digest import render_weekly, week_totals, weekly_growth
 from crashdigest.llm import LlmClient
 from crashdigest.scheduler import (
     install_sigterm_handler,
+    local_clock,
     next_run_at,
     resolved_zone_name,
     run_forever,
@@ -370,53 +370,25 @@ def _notify_failure(deps: Deps, headline: str, detail: str) -> None:
         _log(f"не удалось сообщить об ошибке в Telegram: {exc}")
 
 
-def _startup_text(
-    cfg: Config, *, zone: str, now: datetime, last_success: datetime | None
-) -> str:
-    """Текст стартового сообщения. Чистая функция: зона и время приходят
-    снаружи, поэтому проверяется без реального Telegram и часов.
-    """
+def _log_startup_info(cfg: Config, deps: Deps, *, now: datetime) -> None:
+    """Пишет диагностику старта только в лог контейнера, без отправки в Telegram."""
+    zone = resolved_zone_name()
     next_text = next_run_at(now, cfg.schedule).isoformat(timespec="seconds")
+    last_success = deps.state.last_success_at()
     if last_success is None:
         last_text = "ещё не было"
     else:
         last_text = last_success.astimezone(now.tzinfo).isoformat(timespec="seconds")
-    rows = [
-        ["🕐 Зона", md.esc(zone)],
-        ["⏱ Расписание", f"`{cfg.schedule}`"],
-        ["▶️ Следующий прогон", next_text],
-        ["✅ Последний успешный", last_text],
+    parts = [
+        f"старт {cfg.app_name}",
+        f"зона={zone}",
+        f"расписание={cfg.schedule!r}",
+        f"следующий={next_text}",
+        f"последний_успешный={last_text}",
     ]
     if cfg.analysis_enabled:
-        # Модель задаётся параметром compose, а не кодом: контейнер, молча
-        # поднявшийся не с той моделью, иначе ничем себя не выдаёт — ровно та
-        # же причина, по которой здесь печатается разрешённая зона.
-        # Без md.esc внутри обратных кавычек — ровно как строкой выше у
-        # расписания: внутри code-span разметки нет, а экранирующий слэш
-        # показался бы получателю как слэш.
-        rows.append(["🤖 Разбор",
-                     f"`{cfg.llm_model}`, до {cfg.analyze_top} на прогон"])
-
-    return "\n".join([
-        f"# 🚀 {md.esc(cfg.app_name)} — контейнер запущен",
-        "",
-        md.table(("", ""), rows, "ll"),
-    ])
-
-
-def _send_startup_message(cfg: Config, deps: Deps, *, now: datetime) -> None:
-    """Каждый передеплой становится самопроверяемым: видно зону, расписание,
-    следующий прогон и когда был последний успешный. Молчаливый откат TZ на
-    UTC иначе никак не заметен. Отказ отправки не должен мешать старту.
-    """
-    text = _startup_text(
-        cfg, zone=resolved_zone_name(), now=now,
-        last_success=deps.state.last_success_at(),
-    )
-    try:
-        deps.telegram.send([text])
-    except Exception as exc:  # noqa: BLE001 — стартовое сообщение не блокирует запуск
-        _log(f"не удалось отправить стартовое сообщение: {exc}")
+        parts.append(f"разбор={cfg.llm_model} (до {cfg.analyze_top})")
+    _log(", ".join(parts))
 
 
 def _catch_up_due(last_success: datetime | None, now: datetime, schedule: str) -> bool:
@@ -426,7 +398,14 @@ def _catch_up_due(last_success: datetime | None, now: datetime, schedule: str) -
     или перезагрузка NAS иначе откладывали бы дайджест на срок до суток, а
     сломанный деплой обнаруживался бы только в плановый час.
     """
-    return last_success is None or now >= next_run_at(last_success, schedule)
+    if last_success is None:
+        return True
+    # `last_success` из SQLite приходит в UTC, тогда как cron-расписание задаётся
+    # в локальной зоне (`now.tzinfo`). Без перевода в зону `now` запуск в 10:00 MSK
+    # (= 07:00 UTC) выглядел бы для croniter как 07:00 настенного времени, следующий
+    # срок считался бы как 10:00 UTC (= 13:00 MSK) того же дня, и любой вечерний
+    # рестарт ошибочно отправлял бы повторный дневной отчёт.
+    return now >= next_run_at(last_success.astimezone(now.tzinfo), schedule)
 
 
 def _run_startup_catch_up(cfg: Config, deps: Deps, *, now: datetime) -> None:
@@ -483,7 +462,7 @@ def main(argv=None) -> int:
             return 2
         try:
             return _analyze_one(cfg, deps, args.analyze,
-                                now=datetime.now().astimezone(),
+                                now=local_clock(),
                                 dry_run=args.dry_run)
         except Exception as exc:  # noqa: BLE001
             _log(f"разбор не удался: {type(exc).__name__}: {exc}")
@@ -491,21 +470,19 @@ def main(argv=None) -> int:
 
     if args.once or args.bootstrap:
         try:
-            run_once(cfg, deps, now=datetime.now().astimezone(),
+            run_once(cfg, deps, now=local_clock(),
                      bootstrap=args.bootstrap)
         except Exception:  # noqa: BLE001 — run_once уже сообщил и залогировал
             return 1
         return 0
 
     should_stop = install_sigterm_handler()
-    _log(f"планировщик запущен, расписание {cfg.schedule!r}")
-
-    startup_now = datetime.now().astimezone()
-    _send_startup_message(cfg, deps, now=startup_now)
+    startup_now = local_clock()
+    _log_startup_info(cfg, deps, now=startup_now)
     _run_startup_catch_up(cfg, deps, now=startup_now)
 
     def job() -> None:
-        run_once(cfg, deps, now=datetime.now().astimezone())
+        run_once(cfg, deps, now=local_clock())
 
     run_forever(
         job, cfg.schedule,

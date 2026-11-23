@@ -34,7 +34,7 @@ def resolved_zone_name() -> str:
     return zone.key if isinstance(zone, ZoneInfo) else str(zone)
 
 
-def _local_clock() -> datetime:
+def local_clock() -> datetime:
     """Текущее локальное время в САМОЙ зоне, а не в её сегодняшнем смещении.
 
     `datetime.now().astimezone()` возвращает fixed-offset `datetime.timezone`.
@@ -44,6 +44,9 @@ def _local_clock() -> datetime:
     смещением — 10:00+02:00, то есть на час раньше по UTC. Проверено.
     """
     return datetime.now(_local_zone())
+
+
+_local_clock = local_clock
 
 
 def next_run_at(now: datetime, schedule: str) -> datetime:

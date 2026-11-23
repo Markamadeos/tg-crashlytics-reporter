@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -15,9 +16,8 @@ from crashdigest.main import (
     Deps,
     _analyze_one,
     _catch_up_due,
+    _log_startup_info,
     _run_startup_catch_up,
-    _send_startup_message,
-    _startup_text,
     _weekly_due,
     build_deps,
     run_once,
@@ -317,33 +317,98 @@ def test_catch_up_not_due_when_next_scheduled_run_still_ahead():
     assert _catch_up_due(last, now, "0 10 * * *") is False
 
 
-def test_startup_text_reports_never_succeeded():
-    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=None)
-    assert "Europe/Moscow" in text
-    assert "0 10 * * *" in text
-    assert "ещё не было" in text
+def test_catch_up_not_due_on_evening_restart_when_last_success_stored_in_utc():
+    """Регрессия: State хранит last_success_at в UTC (07:00 UTC = 10:00 MSK).
+
+    Вечерний перезапуск в 22:50 MSK в тот же день НЕ должен считать, что
+    дневной отчёт пропущен: без перевода last_success в локальную зону
+    croniter видел 07:00 и назначал следующий запуск на 10:00 UTC (13:00 MSK).
+    """
+    msk = ZoneInfo("Europe/Moscow")
+    last_utc = datetime(2026, 11, 23, 7, 0, 2, tzinfo=timezone.utc)  # 10:00:02 MSK
+    evening_msk = datetime(2026, 11, 23, 22, 50, tzinfo=msk)
+    assert _catch_up_due(last_utc, evening_msk, "0 10 * * *") is False
 
 
-def test_startup_text_reports_last_success_timestamp():
-    last = NOW - timedelta(days=1)
-    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=last)
-    assert last.astimezone(NOW.tzinfo).isoformat(timespec="seconds") in text
+def test_catch_up_due_next_day_evening_when_last_success_stored_in_utc():
+    """Настоящий пропуск: последний прогон был вчера в 10:00 MSK, сегодня 10:00 пропущено."""
+    msk = ZoneInfo("Europe/Moscow")
+    yesterday_utc = datetime(2026, 11, 22, 7, 0, 2, tzinfo=timezone.utc)
+    today_evening_msk = datetime(2026, 11, 23, 22, 50, tzinfo=msk)
+    assert _catch_up_due(yesterday_utc, today_evening_msk, "0 10 * * *") is True
 
 
-def test_send_startup_message_reports_schedule(state):
+def test_catch_up_not_due_with_negative_utc_offset():
+    """Проверка обратной стороны: отрицательное смещение UTC (например, New York)."""
+    ny = ZoneInfo("America/New_York")
+    # 10:00:02 EST = 15:00:02 UTC
+    last_utc = datetime(2026, 11, 23, 15, 0, 2, tzinfo=timezone.utc)
+    evening_ny = datetime(2026, 11, 23, 22, 0, tzinfo=ny)
+    assert _catch_up_due(last_utc, evening_ny, "0 10 * * *") is False
+
+
+def test_log_startup_info_writes_stdout_without_telegram(state, capsys):
     tg = FakeTelegram()
     deps = Deps(crashlytics=FakeCrashlytics(), state=state, telegram=tg)
 
-    _send_startup_message(CFG, deps, now=NOW)
+    _log_startup_info(CFG, deps, now=NOW)
 
-    assert tg.sent and "0 10 * * *" in tg.sent[0]
+    out = capsys.readouterr().out
+    assert "0 10 * * *" in out
+    assert "ещё не было" in out
+    assert tg.sent == []
 
 
-def test_send_startup_message_failure_does_not_raise(state):
-    tg = FakeTelegram(error=RuntimeError("down"))
+def test_log_startup_info_reports_last_success_and_model(state, capsys):
+    last = NOW - timedelta(days=1)
+    state.mark_success(last)
+    tg = FakeTelegram()
     deps = Deps(crashlytics=FakeCrashlytics(), state=state, telegram=tg)
 
-    _send_startup_message(CFG, deps, now=NOW)  # не должно бросить наружу
+    _log_startup_info(CFG_ANALYSIS, deps, now=NOW)
+
+    out = capsys.readouterr().out
+    assert last.astimezone(NOW.tzinfo).isoformat(timespec="seconds") in out
+    assert "model-x" in out
+    assert tg.sent == []
+
+
+def test_daemon_startup_sends_nothing_on_evening_restart(monkeypatch, tmp_path):
+    """Сквозная проверка daemon-старта: ни стартового сообщения, ни лишнего
+    вечернего дейли-отчёта, если сегодняшний прогон уже был в 10:00 MSK."""
+    msk = ZoneInfo("Europe/Moscow")
+    db_path = str(tmp_path / "state.db")
+    st = State(db_path)
+    st.mark_success(datetime(2026, 11, 23, 7, 0, 2, tzinfo=timezone.utc))
+    st.close()
+
+    monkeypatch.setenv("TZ", "Europe/Moscow")
+    monkeypatch.setenv("CRASHLYTICS_PROJECT", "p")
+    monkeypatch.setenv("CRASHLYTICS_APP_ID", "a")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/sa.json")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bt")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100")
+    monkeypatch.setenv("SCHEDULE", "0 10 * * *")
+    monkeypatch.setenv("STATE_PATH", db_path)
+
+    tg = FakeTelegram()
+    crash = FakeCrashlytics([row("a")])
+
+    import crashdigest.main as main_mod
+
+    monkeypatch.setattr(main_mod, "Telegram", lambda *a, **kw: tg)
+    monkeypatch.setattr(
+        main_mod, "build_deps",
+        lambda cfg, telegram=None: Deps(crashlytics=crash, state=State(cfg.state_path), telegram=tg),
+    )
+    monkeypatch.setattr(main_mod, "local_clock", lambda: datetime(2026, 11, 23, 22, 50, tzinfo=msk))
+    monkeypatch.setattr(main_mod, "install_sigterm_handler", lambda: (lambda: True))
+
+    code = main_mod.main([])
+
+    assert code == 0
+    assert tg.sent == []
+    assert crash.calls == []
 
 
 def test_startup_catch_up_runs_job_when_never_succeeded(state):
@@ -661,14 +726,6 @@ def test_weekly_send_is_recorded_in_state(state):
     assert not any("Фон за неделю" in m for m in tg2.sent)
 
 
-def test_startup_message_is_a_rich_table():
-    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=None)
-    assert "# 🚀 Example — контейнер запущен" in text
-    assert "| 🕐 Зона | Europe/Moscow |" in text
-    assert "| ⏱ Расписание |" in text
-    assert "ещё не было" in text
-
-
 def test_failures_go_through_send_plain(state):
     """Сообщение об отказе обязано идти старым методом, а не rich."""
     calls = {"rich": 0, "plain": 0}
@@ -897,18 +954,10 @@ def test_no_new_crashes_means_no_comments(state):
     assert "cursor" not in tg.trace
 
 
-def test_startup_message_shows_model_when_analysis_is_on():
-    """Модель задаётся параметром compose. Контейнер, поднявшийся не с той
-    моделью, иначе ничем себя не выдаёт — та же причина, что у печати зоны."""
-    text = _startup_text(CFG_ANALYSIS, zone="Europe/Moscow", now=NOW,
-                         last_success=None)
-    assert "model-x" in text
-    assert "до 2 на прогон" in text
-
-
-def test_startup_message_stays_silent_about_disabled_analysis():
-    text = _startup_text(CFG, zone="Europe/Moscow", now=NOW, last_success=None)
-    assert "Разбор" not in text
+def test_log_startup_info_stays_silent_about_disabled_analysis(state, capsys):
+    deps = Deps(crashlytics=FakeCrashlytics(), state=state, telegram=FakeTelegram())
+    _log_startup_info(CFG, deps, now=NOW)
+    assert "разбор=" not in capsys.readouterr().out
 
 
 # --- отладочный путь --analyze --------------------------------------------
